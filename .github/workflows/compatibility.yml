@@ -1,0 +1,92 @@
+name: SDK Compatibility Check
+
+on:
+  schedule:
+    # Run weekly on Mondays at 6am UTC
+    - cron: "0 6 * * 1"
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  check-compatibility:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Get latest SDK version
+        id: sdk-version
+        run: |
+          LATEST=$(uv pip compile --quiet - <<< "openai-agents" | grep -oP "openai-agents==\K[0-9.]+")
+          echo "latest=$LATEST" >> $GITHUB_OUTPUT
+          echo "Latest SDK version: $LATEST"
+
+      - name: Check last tested version
+        id: last-tested
+        run: |
+          if [ -f .last-tested-sdk-version ]; then
+            TESTED=$(cat .last-tested-sdk-version)
+          else
+            TESTED="0.0.0"
+          fi
+          echo "tested=$TESTED" >> $GITHUB_OUTPUT
+          echo "Last tested version: $TESTED"
+
+      - name: Install dependencies with latest SDK
+        run: |
+          uv sync --all-extras
+          uv pip install openai-agents --upgrade
+
+      - name: Run tests
+        run: uv run pytest --cov=src/openai_agents_context_compaction --cov-fail-under=90
+
+      - name: Update last tested version
+        if: success()
+        run: |
+          echo "${{ steps.sdk-version.outputs.latest }}" > .last-tested-sdk-version
+
+      - name: Commit version update
+        if: success() && steps.sdk-version.outputs.latest != steps.last-tested.outputs.tested
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add .last-tested-sdk-version
+          git diff --staged --quiet || git commit -m "chore: tested against openai-agents ${{ steps.sdk-version.outputs.latest }}"
+          git push
+
+      - name: Create issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = "Compatibility issue with openai-agents ${{ steps.sdk-version.outputs.latest }}";
+            const body = "The weekly compatibility check failed against openai-agents version ${{ steps.sdk-version.outputs.latest }}.\n\nPlease investigate and update the package as needed.\n\n[View workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})";
+
+            // Check if issue already exists
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              labels: "compatibility"
+            });
+
+            const existingIssue = issues.data.find(issue => issue.title === title);
+
+            if (!existingIssue) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ["compatibility", "bug"]
+              });
+            }
