@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Sliding window compaction with function call pair atomicity (`window_size`)
 - Initial project setup
 - Package structure and build configuration
 - CI/CD workflows for testing, compatibility checks, and PyPI publishing
