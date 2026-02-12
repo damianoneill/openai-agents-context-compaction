@@ -272,7 +272,7 @@ class TestLocalCompactionSession:
         assert items == [fc_new, fco_new], "only the most recent function call pair should survive"
 
     @pytest.mark.asyncio
-    async def test_pass_through_behavior(self) -> None:
+    async def test_limit_alone_triggers_boundary_aware_compact(self) -> None:
         """window_size=None disables window compaction, but limit still triggers
         boundary_aware_compact() to ensure function call pair atomicity.
 
@@ -329,7 +329,7 @@ class TestLocalCompactionSession:
         The Responses API may add new item types (e.g., reasoning, file_search_call).
         Rather than silently dropping them, we:
         - Log a warning about the unknown type
-        - Keep the item as a single-item chunk
+        - Keep the item as a single item
 
         This ensures forward compatibility when OpenAI adds new response types.
         """
@@ -351,3 +351,88 @@ class TestLocalCompactionSession:
         assert any(
             "unknown item type encountered" in record.message.lower() for record in caplog.records
         ), "Expected warning about unknown item type"
+
+    @pytest.mark.asyncio
+    async def test_order_preserved_with_interleaved_messages(self) -> None:
+        """Items between a function_call and its output retain their original position.
+
+        Scenario: A user message sits between a function_call and its output
+        (e.g., user commented while a tool was running). After compaction the
+        original chronological order must be preserved — the user message must
+        NOT be displaced before or after the pair.
+
+        This verifies the index-marking algorithm preserves original ordering,
+        unlike a pair-bundling approach that would group fc/fco together and
+        displace the interleaved message.
+        """
+        mock = MockSession()
+        fc = function_call("a", "slow_tool")
+        msg = user_msg("why so slow?")
+        fco = function_call_output("a", "done")
+        await mock.add_items([fc, msg, fco])
+
+        compacting = LocalCompactionSession(mock, window_size=3)
+        items = await compacting.get_items()
+        self._validate_invariants(items)
+        # Original order must be preserved: fc, msg, fco — NOT msg, fc, fco
+        assert items == [fc, msg, fco], (
+            "Interleaved message must stay between function_call and its output"
+        )
+
+    @pytest.mark.asyncio
+    async def test_order_preserved_with_batch_function_calls(self) -> None:
+        """Batch function calls retain their original SDK ordering after compaction.
+
+        The OpenAI Agents SDK emits batch tool calls as:
+            [fc(a), fc(b), fco(a), fco(b)]
+        i.e., all calls first, then all outputs. Compaction must preserve this
+        ordering and NOT regroup into [fc(a), fco(a), fc(b), fco(b)].
+        """
+        mock = MockSession()
+        fc_a = function_call("a", "tool_a")
+        fc_b = function_call("b", "tool_b")
+        fco_a = function_call_output("a", "result_a")
+        fco_b = function_call_output("b", "result_b")
+        await mock.add_items([fc_a, fc_b, fco_a, fco_b])
+
+        compacting = LocalCompactionSession(mock, window_size=4)
+        items = await compacting.get_items()
+        self._validate_invariants(items)
+        # Original SDK batch order must be preserved
+        assert items == [fc_a, fc_b, fco_a, fco_b], (
+            "Batch function call order must be preserved: all calls then all outputs"
+        )
+
+    @pytest.mark.asyncio
+    async def test_order_preserved_partial_window_with_interleaved(self) -> None:
+        """When window is too small for all items, kept items preserve original order.
+
+        Setup: [msg1, fc(a), msg2, fco(a), msg3] — 5 items, window=4.
+        The oldest item (msg1) is dropped, but the remaining 4 items must
+        retain their original relative ordering including msg2 between the pair.
+        """
+        mock = MockSession()
+        msg1 = user_msg("old")
+        fc = function_call("a")
+        msg2 = user_msg("middle")
+        fco = function_call_output("a")
+        msg3 = user_msg("recent")
+        await mock.add_items([msg1, fc, msg2, fco, msg3])
+
+        compacting = LocalCompactionSession(mock, window_size=4)
+        items = await compacting.get_items()
+        self._validate_invariants(items)
+        assert len(items) <= 4
+        # msg3 (most recent) must be present
+        assert msg3 in items
+        # The pair must be kept atomically
+        assert fc in items
+        assert fco in items
+        # If msg2 is present, it must be between fc and fco (original order)
+        if msg2 in items:
+            fc_idx = items.index(fc)
+            msg2_idx = items.index(msg2)
+            fco_idx = items.index(fco)
+            assert fc_idx < msg2_idx < fco_idx, (
+                "Interleaved message must remain between function_call and output"
+            )

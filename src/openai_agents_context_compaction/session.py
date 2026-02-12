@@ -14,24 +14,29 @@ COMPACTION PIPELINE:
                                     │
                                     ▼
     ┌───────────────────────────────────────────────────────────────────────────┐
-    │  1. BACKWARD WALK (boundary_aware_compact)                                │
-    │     Start from most recent, walk backwards                                │
-    │     Group into "chunks": single messages OR function call pairs           │
+    │  1. INDEX MAPPING (boundary_aware_compact)                                │
+    │     Build call_id → {call_index, output_index} map                        │
+    │     Identify complete pairs (both call and output present)                │
     └───────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
     ┌───────────────────────────────────────────────────────────────────────────┐
-    │  2. CHUNKS (reverse chronological order)                                  │
-    │     [user_msg], [func_call(orphan)], [asst_msg],                          │
-    │     [func_call(b), output(b)], [func_call(a), output(a)], [user_msg]      │
-    │           ↑ dropped                  ↑ complete pairs                     │
+    │  2. BACKWARD WALK WITH BUDGET (boundary_aware_compact)                    │
+    │     Walk backwards from most recent item                                  │
+    │     Track budget (remaining window capacity)                              │
+    │     - function_call_output (complete pair): reserve budget for BOTH       │
+    │       output and its matching call (budget -= 2), mark both indices       │
+    │     - function_call (already marked): skip (already budgeted)             │
+    │     - function_call (orphan/pair not selected): skip                      │
+    │     - regular message / unknown type: include if budget > 0              │
+    │     Items are marked at their ORIGINAL indices                            │
     └───────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
     ┌───────────────────────────────────────────────────────────────────────────┐
-    │  3. PACK INTO WINDOW (_pack_chunks_into_window)                           │
-    │     Fill window with chunks using strict recency                          │
-    │     window_size=4: [user_msg] + [func_call(b), output(b)] + [asst_msg]    │
+    │  3. COLLECT IN ORIGINAL ORDER                                             │
+    │     Gather marked items by ascending index                                │
+    │     Original chronological ordering is preserved                          │
     └───────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
@@ -42,9 +47,17 @@ COMPACTION PIPELINE:
                                     │
                                     ▼
     ┌───────────────────────────────────────────────────────────────────────────┐
-    │  Result (chronological order)                                             │
+    │  Result (chronological order — original ordering preserved)               │
     │  [asst_msg, func_call(b), output(b), user_msg]                            │
     └───────────────────────────────────────────────────────────────────────────┘
+
+Order Preservation:
+- Unlike a pair-bundling approach that groups fc/fco together then reassembles,
+  this algorithm marks items at their original indices and collects them
+  in order. This means items that appeared between a function_call and its
+  output remain in their original position relative to both.
+- Example: [fc(a), fc(b), output(a), output(b)] stays in that order,
+  NOT reordered to [fc(a), output(a), fc(b), output(b)].
 
 Responses API Format (used by OpenAI Agents SDK):
 - function_call: {"type": "function_call", "call_id": "...", "name": "...", "arguments": "..."}
@@ -93,68 +106,25 @@ def _get_call_id(item: TResponseInputItem) -> str | None:
     return str(call_id) if call_id is not None else None
 
 
-def _is_message(item: TResponseInputItem) -> bool:
-    """Check if item is a regular message (user/assistant without function call)."""
+def _is_conversation_message(item: TResponseInputItem) -> bool:
+    """Check if item is a conversation message (user/assistant, not tool calls)."""
     # User messages have role but no type, or type != function_call
     # Assistant messages have role=assistant and type=message
+    # Note: system messages don't appear in session history (SDK invariant)
     if _is_function_call(item) or _is_function_call_output(item):
         return False
     return item.get("role") in ("user", "assistant")
-
-
-def _pack_chunks_into_window(
-    chunks: list[list[TResponseInputItem]], window_size: int
-) -> list[TResponseInputItem]:
-    """Pack chunks into window using strict recency, never splitting function call pairs.
-
-    Strategy:
-    - Fill window with chunks in recency order (most recent first)
-    - Function call pairs that don't fit are dropped (recency wins over completeness)
-    - If window is smaller than a function call pair and result is empty, keep the pair
-      anyway to ensure we return meaningful data rather than nothing
-
-    Note: window_size is a "soft" limit only for the edge case where the most recent
-    item is a function call pair (2 items) and window_size=1. In this case, the pair
-    is kept anyway rather than returning an empty result.
-
-    Args:
-        chunks: List of chunks in reverse chronological order (most recent first).
-        window_size: Maximum number of items the window can hold.
-
-    Returns:
-        Flattened list of items in chronological order.
-    """
-    if window_size <= 0:
-        return []
-
-    result_chunks: list[list[TResponseInputItem]] = []
-    total_items = 0
-
-    for chunk in chunks:
-        if total_items + len(chunk) <= window_size:
-            # This chunk fits - add it
-            result_chunks.append(chunk)
-            total_items += len(chunk)
-        elif total_items == 0 and len(chunk) > 1:
-            # Window too small for this function call pair, but result is empty.
-            # Keep the most recent pair anyway to return meaningful data.
-            logger.debug(
-                f"Window size {window_size} smaller than function call pair size {len(chunk)}, "
-                "keeping pair anyway"
-            )
-            result_chunks.append(chunk)
-            total_items += len(chunk)
-        # If chunk doesn't fit and result is not empty, skip it (strict recency)
-
-    # Reverse and flatten to chronological order
-    return [item for chunk in reversed(result_chunks) for item in chunk]
 
 
 def boundary_aware_compact(
     items: list[TResponseInputItem],
     window_size: int,
 ) -> list[TResponseInputItem]:
-    """Compact history while preserving function call pairs (Responses API format).
+    """Compact history while preserving function call pairs and original ordering.
+
+    Uses an index-marking algorithm that preserves the original chronological
+    ordering of items. Unlike a pair-bundling approach, items that appear between
+    a function_call and its output retain their original position.
 
     Responses API Function Call Pairs:
     - A function call pair = function_call + its matching function_call_output (same call_id)
@@ -162,15 +132,19 @@ def boundary_aware_compact(
     - Pairs are ATOMIC: keep both function_call and output, or drop both
 
     Algorithm:
-    1. Walk backwards through items, grouping them into "chunks"
-    2. Each chunk is either: [single_message] OR [function_call, function_call_output]
-    3. Pack chunks into window using strict recency (no prioritization)
+    1. Build a map of call_id -> {call_index, output_index} to identify complete pairs
+    2. Walk backwards through items, tracking a budget (remaining window capacity)
+    3. For function_call_output with a complete pair: if budget >= 2, mark BOTH the
+       output and its matching function_call at their original indices (budget -= 2)
+    4. For function_call already marked: skip (already budgeted)
+    5. For regular messages/unknown types: mark if budget > 0 (budget -= 1)
+    6. Collect marked items in ascending index order (preserving original ordering)
 
     Edge cases:
     - window_size <= 0: returns []
-    - window_size=1: most recent single message kept; function call pairs dropped unless
-      they're the only item (then kept to avoid empty result)
-    - Function call pairs that don't fit the window are dropped (recency wins)
+    - window_size=1: most recent single message kept; function call pairs (needing 2 slots)
+      are skipped unless they're the only thing available (soft limit to avoid empty result)
+    - Function call pairs that don't fit the budget are dropped entirely
     - Orphaned function_call (no output) is dropped
     - Orphaned function_call_output (no call) is dropped
 
@@ -179,7 +153,7 @@ def boundary_aware_compact(
         window_size: Maximum number of items to keep.
 
     Returns:
-        Compacted list of items with function call pairs preserved.
+        Compacted list of items with function call pairs preserved, in original order.
     """
     if window_size <= 0:
         return []
@@ -190,6 +164,7 @@ def boundary_aware_compact(
     # =========================================================================
     # STEP 1: Build a map of call_id -> (function_call_index, function_call_output_index)
     # This allows us to identify complete pairs
+    # NOTE: call_id is assumed unique per type (SDK invariant). Duplicates overwrite.
     # =========================================================================
     call_to_indices: dict[str, dict[str, int | None]] = {}
 
@@ -207,74 +182,95 @@ def boundary_aware_compact(
             call_to_indices[call_id]["output"] = idx
 
     # Identify complete pairs (both call and output present)
-    complete_pairs: set[str] = {
-        call_id
-        for call_id, indices in call_to_indices.items()
-        if indices["call"] is not None and indices["output"] is not None
-    }
+    complete_pairs: dict[str, tuple[int, int]] = {}
+    for call_id, indices in call_to_indices.items():
+        if indices["call"] is not None and indices["output"] is not None:
+            complete_pairs[call_id] = (indices["call"], indices["output"])
 
     # =========================================================================
-    # STEP 2: Walk backwards through items, grouping them into "chunks"
-    # A chunk is either: [single_message] OR [function_call, function_call_output]
+    # STEP 2: Walk backwards, marking indices to include while tracking budget
+    # Budget represents remaining window capacity. Including a complete pair
+    # costs 2 from the budget (reserved upfront when the output is encountered).
     # =========================================================================
-    chunks: list[list[TResponseInputItem]] = []
-    idx = len(items) - 1  # Start from the end (most recent)
-    processed_call_ids: set[str] = set()
+    included_indices: set[int] = set()
+    required_call_ids: set[str] = set()  # call_ids whose function_call we must include
+    budget = window_size
 
-    while idx >= 0:
+    for idx in range(len(items) - 1, -1, -1):
         current_item = items[idx]
 
         # ----- CASE A: function_call_output -----
         if _is_function_call_output(current_item):
             call_id = _get_call_id(current_item)
 
-            if call_id and call_id in complete_pairs and call_id not in processed_call_ids:
-                # Find the matching function_call
-                call_idx = call_to_indices[call_id]["call"]
-                if call_idx is not None:
-                    function_call = items[call_idx]
-                    # Bundle as atomic chunk: [function_call, function_call_output]
-                    chunks.append([function_call, current_item])
-                    processed_call_ids.add(call_id)
+            if call_id and call_id in complete_pairs:
+                if budget >= 2:
+                    # Reserve budget for both output AND its matching call
+                    included_indices.add(idx)
+                    call_idx = complete_pairs[call_id][0]
+                    included_indices.add(call_idx)
+                    required_call_ids.add(call_id)
+                    budget -= 2
+                elif not included_indices:
+                    # Soft limit: nothing included yet, so this pair is the most
+                    # recent actionable content. Keep it to avoid returning
+                    # empty/stale data even though it exceeds window_size.
+                    logger.debug(
+                        "Window size %d smaller than function call pair size 2, "
+                        "keeping pair anyway",
+                        window_size,
+                    )
+                    included_indices.add(idx)
+                    call_idx = complete_pairs[call_id][0]
+                    included_indices.add(call_idx)
+                    required_call_ids.add(call_id)
+                    budget = 0  # prevent further inclusions
+                else:
+                    # Not enough budget for the pair — skip entirely
+                    logger.debug(
+                        "Skipping function call pair call_id=%s: budget %d < 2",
+                        call_id,
+                        budget,
+                    )
             else:
-                # Orphaned output - skip it
-                logger.debug(f"Dropping orphaned function_call_output with call_id={call_id}")
-
-            idx -= 1
+                # Orphaned output (no matching call) - skip
+                logger.debug("Dropping orphaned function_call_output with call_id=%s", call_id)
             continue
 
         # ----- CASE B: function_call -----
         if _is_function_call(current_item):
             call_id = _get_call_id(current_item)
 
-            if call_id and call_id in processed_call_ids:
-                # Already processed as part of a complete pair - skip
-                idx -= 1
+            if call_id and call_id in required_call_ids:
+                # Already marked and budgeted when we processed its output — skip
                 continue
 
-            # Orphaned function_call (no output) - skip it
-            logger.debug(f"Dropping orphaned function_call with call_id={call_id}")
-            idx -= 1
+            # Orphaned function_call (no output, or pair wasn't selected) - skip
+            logger.debug("Dropping orphaned function_call with call_id=%s", call_id)
             continue
 
         # ----- CASE C: Normal message (user/assistant) -----
-        if _is_message(current_item):
-            chunks.append([current_item])
-            idx -= 1
+        if _is_conversation_message(current_item):
+            if budget > 0:
+                included_indices.add(idx)
+                budget -= 1
             continue
 
         # ----- CASE D: Unknown item type -----
-        # Treat as single-item chunk to preserve future Responses API types
+        # Treat as single item to preserve future Responses API types
         # (e.g. reasoning, file_search_call) rather than silently dropping them.
-        logger.warning(
-            f"Unknown item type encountered: {current_item.get('type')!r}. "
-            "Treating as single-item chunk."
-        )
-        chunks.append([current_item])
-        idx -= 1
+        if budget > 0:
+            logger.warning(
+                "Unknown item type encountered: %r. Including as single item.",
+                current_item.get("type"),
+            )
+            included_indices.add(idx)
+            budget -= 1
 
-    # Pack chunks into window using strict recency
-    return _pack_chunks_into_window(chunks, window_size)
+    # =========================================================================
+    # STEP 3: Collect items in original chronological order
+    # =========================================================================
+    return [items[i] for i in sorted(included_indices)]
 
 
 def drop_orphaned_tool_outputs(
@@ -320,7 +316,8 @@ def drop_orphaned_tool_outputs(
                 cleaned.append(item)
             else:
                 logger.debug(
-                    f"Safety validator: dropping orphaned function_call with call_id={call_id}"
+                    "Safety validator: dropping orphaned function_call with call_id=%s",
+                    call_id,
                 )
             continue
 
@@ -329,8 +326,8 @@ def drop_orphaned_tool_outputs(
                 cleaned.append(item)
             else:
                 logger.debug(
-                    f"Safety validator: dropping orphaned function_call_output "
-                    f"with call_id={call_id}"
+                    "Safety validator: dropping orphaned function_call_output with call_id=%s",
+                    call_id,
                 )
             continue
 
@@ -417,12 +414,13 @@ class LocalCompactionSession(Session):
             original_count = len(items)
             items = boundary_aware_compact(items, effective_size)
             dropped = original_count - len(items)
-            # NOTE: Always log during alpha for visibility. Later, consider:
-            # - Move to DEBUG level
-            # - Only log when dropped > 0
-            logger.info(
-                f"[session={self.session_id}] Compacted {original_count} → {len(items)} items "
-                f"(dropped {dropped}, window={effective_size})"
+            logger.debug(
+                "[session=%s] Compacted %d → %d items (dropped %d, window=%d)",
+                self.session_id,
+                original_count,
+                len(items),
+                dropped,
+                effective_size,
             )
 
         # NOTE: This call is intentional as a defense-in-depth safety validator.

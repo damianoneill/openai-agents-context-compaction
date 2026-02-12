@@ -59,6 +59,7 @@ result = await Runner.run(agent, "Hello!", session=session)
 
 - `window_size` controls how many items to keep in the sliding window
 - Compaction is **boundary-aware** – preserves function call pairs atomically
+- **`limit` parameter**: Also boundary-aware — not a simple tail slice; function call pairs are kept atomic even when using `limit`
 
 ### Technical Note
 
