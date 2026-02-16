@@ -364,6 +364,15 @@ class LocalCompactionSession(Session):
         """
         self._session = session
         self._window_size = window_size
+        self._cache: list[TResponseInputItem] | None = None
+        self._cached_effective_size: int | None = None
+
+    def _invalidate_cache(self) -> None:
+        """Clear the compaction cache, forcing recomputation on next get_items()."""
+        if self._cache is not None:
+            logger.debug("[session=%s] Cache invalidated", self._session.session_id)
+        self._cache = None
+        self._cached_effective_size = None
 
     @property
     def session_id(self) -> str:
@@ -393,12 +402,6 @@ class LocalCompactionSession(Session):
             List of input items representing the conversation history.
             Function call pairs (function_call + function_call_output) are always atomic.
         """
-        # NOTE: We always fetch ALL items from the underlying session, ignoring
-        # its `limit` parameter, because boundary-aware compaction needs the full
-        # history to correctly identify and preserve function call pairs. This means
-        # memory usage scales with total session size, not window_size.
-        items = await self._session.get_items()
-
         # Combine window_size and limit to maintain atomicity
         effective_size: int | None
         if self._window_size is not None and limit is not None:
@@ -409,6 +412,29 @@ class LocalCompactionSession(Session):
             effective_size = limit
         else:
             effective_size = None
+
+        # Return cached result if compaction parameters haven't changed
+        if self._cache is not None and self._cached_effective_size == effective_size:
+            logger.debug(
+                "[session=%s] Cache hit (effective_size=%s, cached_items=%d)",
+                self.session_id,
+                effective_size,
+                len(self._cache),
+            )
+            return list(self._cache)  # Copy to prevent caller mutation
+
+        logger.debug(
+            "[session=%s] Cache miss (effective_size=%s, previous=%s)",
+            self.session_id,
+            effective_size,
+            self._cached_effective_size,
+        )
+
+        # NOTE: We always fetch ALL items from the underlying session, ignoring
+        # its `limit` parameter, because boundary-aware compaction needs the full
+        # history to correctly identify and preserve function call pairs. This means
+        # memory usage scales with total session size, not window_size.
+        items = await self._session.get_items()
 
         if effective_size is not None:
             original_count = len(items)
@@ -426,7 +452,11 @@ class LocalCompactionSession(Session):
         # NOTE: This call is intentional as a defense-in-depth safety validator.
         # It ensures that any edge cases missed by boundary_aware_compact are caught.
         items = drop_orphaned_tool_outputs(items)
-        return items
+
+        # Cache the result for subsequent calls within the same turn
+        self._cache = items
+        self._cached_effective_size = effective_size
+        return list(items)  # Copy to prevent caller mutation
 
     async def add_items(self, items: list[TResponseInputItem]) -> None:
         """Add new items to the underlying session's conversation history.
@@ -434,6 +464,7 @@ class LocalCompactionSession(Session):
         Args:
             items: List of input items to add to the history.
         """
+        self._invalidate_cache()
         await self._session.add_items(items)
 
     async def pop_item(self) -> TResponseInputItem | None:
@@ -442,10 +473,12 @@ class LocalCompactionSession(Session):
         Returns:
             The most recent item if it exists, None if the session is empty.
         """
+        self._invalidate_cache()
         return await self._session.pop_item()
 
     async def clear_session(self) -> None:
         """Clear all items from the underlying session."""
+        self._invalidate_cache()
         await self._session.clear_session()
 
     def __repr__(self) -> str:

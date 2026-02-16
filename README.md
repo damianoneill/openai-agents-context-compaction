@@ -57,7 +57,7 @@ session = LocalCompactionSession(underlying, window_size=30)
 result = await Runner.run(agent, "Hello!", session=session)
 ```
 
-- `window_size` controls how many items to keep in the sliding window
+- `window_size` controls how many items to keep in the sliding window (`None`, the default, means no compaction)
 - Compaction is **boundary-aware** – preserves function call pairs atomically
 - **`limit` parameter**: Also boundary-aware — not a simple tail slice; function call pairs are kept atomic even when using `limit`
 
@@ -67,11 +67,10 @@ The OpenAI Agents SDK stores session data in [Responses API format](https://plat
 
 ### Performance Considerations
 
-For very large sessions (thousands of items), compaction runs on every `get_items()` call. The algorithm is O(n) where n is the total session size. If performance becomes a concern:
+For very large sessions (thousands of items), compaction runs on every `get_items()` call. Results are cached and reused within the same agent turn (invalidated on writes), so repeated calls with the same parameters are O(1). The compaction algorithm itself is O(n) where n is the total session size. If performance becomes a concern:
 
 - Consider periodic session pruning at the storage layer
 - Use a reasonable `window_size` that balances context retention with processing cost
-- Future releases may add lazy/cached compaction strategies
 
 ---
 
