@@ -1,6 +1,6 @@
 [project]
 name = "openai-agents-context-compaction"
-version = "0.1.0"
+version = "0.2.0"
 description = "Context compaction for the OpenAI Agents SDK Runner loop"
 readme = "README.md"
 license = { text = "MIT" }
