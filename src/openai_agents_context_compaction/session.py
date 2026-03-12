@@ -78,11 +78,98 @@ from the end and work back until we've filled the window.
 from __future__ import annotations
 
 import logging
+import warnings
+from typing import Any
+
+try:
+    import tiktoken as _tiktoken_mod
+
+    _tiktoken_encoding: Any = _tiktoken_mod.get_encoding("cl100k_base")
+except ImportError:
+    _tiktoken_encoding = None
+    warnings.warn(
+        "tiktoken is not installed; token counts will use a ~4 chars/token estimate. "
+        "For accurate counts: pip install 'openai-agents-context-compaction[tiktoken]'",
+        ImportWarning,
+        stacklevel=1,
+    )
+except Exception as exc:
+    _tiktoken_encoding = None
+    warnings.warn(
+        f"tiktoken failed to load ({exc}); token counts will use a ~4 chars/token estimate. "
+        "This may be a network error downloading the vocabulary file on first use.",
+        RuntimeWarning,
+        stacklevel=1,
+    )
 
 from agents import Session, TResponseInputItem
 
 # NOTE: Verbose DEBUG logging is intentional during alpha; callers control via logging config.
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Token counting helpers
+# =============================================================================
+#
+# FUTURE: These helpers lay the groundwork for token-based compaction.
+# Currently, token counts are only logged (observability / baseline data).
+# The next step is a compaction mode that enforces a token budget rather than
+# an item-count window — keeping as many recent items as fit within N tokens.
+# =============================================================================
+
+
+def _extract_text(item: TResponseInputItem) -> str:
+    """Extract all text content from a Responses API item for token counting."""
+    parts: list[str] = []
+
+    if _is_function_call(item):
+        # name + JSON-encoded arguments
+        parts.append(str(item.get("name", "")))
+        parts.append(str(item.get("arguments", "")))
+        return " ".join(parts)
+
+    if _is_function_call_output(item):
+        # output can be a plain string or a list of {"type": "input_text", "text": "..."} objects
+        output = item.get("output", "")
+        if isinstance(output, str):
+            parts.append(output)
+        elif isinstance(output, list):
+            for part in output:
+                if isinstance(part, dict):
+                    parts.append(part.get("text", ""))
+        return " ".join(parts)
+
+    # user / assistant message: content can be a plain string or a list of content blocks
+    content = item.get("content", "")
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict):
+                parts.append(block.get("text", ""))
+    return " ".join(parts)
+
+
+def _count_tokens(items: list[TResponseInputItem]) -> int:
+    """Estimate total token count for a list of Responses API items.
+
+    Uses tiktoken (cl100k_base encoding, compatible with GPT-3.5/4) when
+    available.  Falls back to a character-based estimate (~4 chars per token)
+    if tiktoken is not installed.  Each item carries a +4 overhead to account
+    for message-structure tokens (role, separators, etc.).
+
+    Note: GPT-4o uses o200k_base; cl100k_base gives a close approximation.
+    Install tiktoken for accurate counts: pip install openai-agents-context-compaction[tiktoken]
+    """
+    total = 0
+    for item in items:
+        text = _extract_text(item)
+        if _tiktoken_encoding is not None:
+            total += len(_tiktoken_encoding.encode(text)) + 4
+        else:
+            total += max(1, len(text) // 4) + 4
+    return total
 
 
 # =============================================================================
@@ -438,15 +525,21 @@ class LocalCompactionSession(Session):
 
         if effective_size is not None:
             original_count = len(items)
+            # Token counts are logged here to build observability baseline data.
+            # FUTURE: these will drive token-budget compaction (see Token counting helpers above).
+            original_tokens = _count_tokens(items)
             items = boundary_aware_compact(items, effective_size)
             dropped = original_count - len(items)
+            compacted_tokens = _count_tokens(items)
             logger.debug(
-                "[session=%s] Compacted %d → %d items (dropped %d, window=%d)",
+                "[session=%s] Compacted %d → %d items (dropped %d, window=%d) | tokens: %d → %d",
                 self.session_id,
                 original_count,
                 len(items),
                 dropped,
                 effective_size,
+                original_tokens,
+                compacted_tokens,
             )
 
         # NOTE: This call is intentional as a defense-in-depth safety validator.
