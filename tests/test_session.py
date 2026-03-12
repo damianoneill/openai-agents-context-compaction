@@ -8,6 +8,7 @@ import pytest
 from agents import Session, TResponseInputItem
 
 from openai_agents_context_compaction import LocalCompactionSession
+from openai_agents_context_compaction.session import _count_tokens, _extract_text
 
 # -------------------------------------------------------------------
 # Mock Session
@@ -536,3 +537,76 @@ class TestCompactionCaching:
 
         assert len(result1) == 2
         assert len(result2) == 3
+
+
+# -------------------------------------------------------------------
+# Token counting tests
+# -------------------------------------------------------------------
+
+
+class TestExtractText:
+    """Tests for _extract_text — text extraction from Responses API items."""
+
+    def test_function_call(self) -> None:
+        item = function_call("c1", name="my_func", arguments='{"key": "value"}')
+        text = _extract_text(item)
+        assert "my_func" in text
+        assert '{"key": "value"}' in text
+
+    def test_function_call_output_string(self) -> None:
+        item = function_call_output("c1", output="hello world")
+        assert "hello world" in _extract_text(item)
+
+    def test_function_call_output_list(self) -> None:
+        item: TResponseInputItem = {
+            "type": "function_call_output",
+            "call_id": "c1",
+            "output": [
+                {"type": "input_text", "text": "part one"},
+                {"type": "input_text", "text": "part two"},
+            ],
+        }
+        text = _extract_text(item)
+        assert "part one" in text
+        assert "part two" in text
+
+    def test_user_message_string_content(self) -> None:
+        assert "hello" in _extract_text(user_msg("hello"))
+
+    def test_assistant_message_list_content(self) -> None:
+        assert "reply" in _extract_text(assistant_msg("reply"))
+
+    def test_empty_item_returns_string(self) -> None:
+        result = _extract_text({})  # type: ignore[arg-type]
+        assert isinstance(result, str)
+
+
+class TestCountTokens:
+    """Tests for _count_tokens — token estimation for lists of items."""
+
+    def test_empty_list(self) -> None:
+        assert _count_tokens([]) == 0
+
+    def test_single_item_has_overhead(self) -> None:
+        # Each item has +4 overhead; even an empty-content item must count > 0.
+        result = _count_tokens([user_msg("")])
+        assert result >= 4
+
+    def test_more_text_means_more_tokens(self) -> None:
+        short = _count_tokens([user_msg("hi")])
+        long = _count_tokens([user_msg("hello " * 100)])
+        assert long > short
+
+    def test_multiple_items_sum(self) -> None:
+        one = _count_tokens([user_msg("hello")])
+        two = _count_tokens([user_msg("hello"), user_msg("hello")])
+        assert two == one * 2
+
+    def test_fallback_tiny_text_nonzero(self) -> None:
+        # Regression: old code used `len(text) // 4` which gave 0 for short strings.
+        # The fix uses max(1, ...) so single-char content must return > 4 (overhead alone).
+        from openai_agents_context_compaction.session import _tiktoken_encoding
+
+        if _tiktoken_encoding is None:
+            result = _count_tokens([user_msg("x")])
+            assert result > 4  # max(1, 0) + 4 = 5

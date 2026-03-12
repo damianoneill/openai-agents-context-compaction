@@ -36,6 +36,23 @@ This package extends the existing OpenAI Agents SDK `Session` protocol with **lo
 pip install openai-agents-context-compaction
 ```
 
+### Optional: accurate token counting
+
+By default, token counts are estimated using a simple ~4 chars/token heuristic. For accurate counts, install the `tiktoken` extra:
+
+```bash
+pip install 'openai-agents-context-compaction[tiktoken]'
+```
+
+**First-run download:** tiktoken downloads a small vocabulary file (~1 MB) from OpenAI's CDN on first use and caches it locally — subsequent runs are fully offline. If you use Docker, add both lines to your `Dockerfile` so the download happens at build time, not at runtime:
+
+```dockerfile
+RUN pip install 'openai-agents-context-compaction[tiktoken]'
+RUN python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')"
+```
+
+Token counts are currently logged for observability. Token-budget compaction (keeping as many recent items as fit within N tokens) is on the roadmap.
+
 ---
 
 ## Usage
@@ -79,7 +96,7 @@ For very large sessions (thousands of items), compaction runs on every `get_item
 | Feature                       | Status         |
 | ----------------------------- | -------------- |
 | Sliding window compaction     | ✅ Implemented |
-| Token-based limits            | 🟡 Planned     |
+| Token-based limits            | 🔵 In progress (instrumentation done, budget enforcement planned) |
 | LLM-based summarization       | 🟡 Planned     |
 | Write-time compaction         | 🟡 Planned     |
 | Pluggable compaction policies | 🟡 Planned     |
