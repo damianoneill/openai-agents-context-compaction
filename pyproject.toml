@@ -75,7 +75,7 @@ select = ["E", "F", "I", "N", "W", "UP"]
 
 [tool.commitizen]
 name = "cz_conventional_commits"
-version = "0.1.0"
+version = "0.2.1"
 tag_format = "v$version"
 version_files = [
     "pyproject.toml:^version",

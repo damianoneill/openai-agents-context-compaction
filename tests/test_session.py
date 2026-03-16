@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from unittest.mock import patch
 
 import pytest
 from agents import Session, TResponseInputItem
@@ -603,10 +604,14 @@ class TestCountTokens:
         assert two == one * 2
 
     def test_fallback_tiny_text_nonzero(self) -> None:
-        # Regression: old code used `len(text) // 4` which gave 0 for short strings.
-        # The fix uses max(1, ...) so single-char content must return > 4 (overhead alone).
-        from openai_agents_context_compaction.session import _tiktoken_encoding
-
-        if _tiktoken_encoding is None:
+        # Test fallback token counting for very short strings (edge case: single char).
+        # Mock _default_encoding to None to force fallback execution regardless of whether
+        # tiktoken is installed in the test environment.
+        with patch("openai_agents_context_compaction.session._default_encoding", None):
             result = _count_tokens([user_msg("x")])
-            assert result > 4  # max(1, 0) + 4 = 5
+            # Fallback: max(1, len("x")//4) + 4
+            #         = max(1, 1//4) + 4
+            #         = max(1, 0) + 4  [without max(1, ...) this would be 0]
+            #         = 1 + 4
+            #         = 5
+            assert result > 4
