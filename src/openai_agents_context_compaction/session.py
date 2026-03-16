@@ -78,11 +78,119 @@ from the end and work back until we've filled the window.
 from __future__ import annotations
 
 import logging
+import warnings
+from typing import Any
 
 from agents import Session, TResponseInputItem
 
+_tiktoken_mod: Any = None
+_default_encoding: Any = None
+
+try:
+    import tiktoken
+
+    _tiktoken_mod = tiktoken
+    _default_encoding = tiktoken.get_encoding("o200k_base")
+except ImportError:
+    _tiktoken_mod = None
+    _default_encoding = None
+    warnings.warn(
+        "tiktoken is not installed; token counts will use a ~4 chars/token estimate. "
+        "For accurate counts: pip install 'openai-agents-context-compaction[tiktoken]'",
+        UserWarning,
+        stacklevel=1,
+    )
+except Exception as exc:
+    _default_encoding = None
+    warnings.warn(
+        f"tiktoken failed to load encoding ({exc}); "
+        "token counts will use a ~4 chars/token estimate. "
+        "This may be a network error downloading the vocabulary file on first use.",
+        RuntimeWarning,
+        stacklevel=1,
+    )
+
 # NOTE: Verbose DEBUG logging is intentional during alpha; callers control via logging config.
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Token counting helpers
+# =============================================================================
+#
+# FUTURE: These helpers lay the groundwork for token-based compaction.
+# Currently, token counts are only logged (observability / baseline data).
+# The next step is a compaction mode that enforces a token budget rather than
+# an item-count window — keeping as many recent items as fit within N tokens.
+# =============================================================================
+
+
+def _extract_text(item: TResponseInputItem) -> str:
+    """Extract all text content from a Responses API item for token counting."""
+    parts: list[str] = []
+
+    if _is_function_call(item):
+        # name + JSON-encoded arguments
+        parts.append(str(item.get("name", "")))
+        parts.append(str(item.get("arguments", "")))
+        return " ".join(parts)
+
+    if _is_function_call_output(item):
+        # output can be a plain string or a list of {"type": "input_text", "text": "..."} objects
+        output = item.get("output", "")
+        if isinstance(output, str):
+            parts.append(output)
+        elif isinstance(output, list):
+            for part in output:
+                if isinstance(part, dict):
+                    parts.append(part.get("text", ""))
+        return " ".join(parts)
+
+    # user / assistant message: content can be a plain string or a list of content blocks
+    content = item.get("content")
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict):
+                parts.append(block.get("text", ""))
+    elif content is None and ("type" in item or "role" in item):
+        logger.warning(
+            "No content field on item type=%r role=%r. Item: %r",
+            item.get("type"),
+            item.get("role"),
+            item,
+        )
+
+    return " ".join(parts)
+
+
+def _count_tokens(items: list[TResponseInputItem], encoding: Any = None) -> int:
+    """Estimate total token count for a list of Responses API items.
+
+    Uses tiktoken with the provided encoding (defaults to o200k_base for GPT-4o/4.1)
+    when available. Falls back to a character-based estimate (~4 chars per token)
+    if tiktoken is not installed or encoding is None. Each item carries a +4 overhead
+    to account for message-structure tokens (role, separators, etc.).
+
+    Args:
+        items: List of Responses API items to count tokens for.
+        encoding: Optional tiktoken encoding instance. If None, uses the module default.
+
+    Returns:
+        Estimated total token count.
+    """
+    if encoding is None:
+        encoding = _default_encoding
+
+    total = 0
+    for item in items:
+        text = _extract_text(item)
+        if encoding is not None:
+            total += len(encoding.encode(text)) + 4
+        else:
+            total += max(1, len(text) // 4) + 4
+    return total
 
 
 # =============================================================================
@@ -346,31 +454,60 @@ class LocalCompactionSession(Session):
     Args:
         session: The underlying session to wrap.
         window_size: Max items to keep when retrieving. None disables compaction.
+        encoding_name: Tiktoken encoding name for token counting (default: o200k_base
+                       for GPT-4o/4.1). Common values: 'o200k_base' (GPT-4o/4.1),
+                       'cl100k_base' (GPT-3.5/4). Ignored if tiktoken not installed.
 
     Example:
         >>> from agents import SQLiteSession
         >>> underlying = SQLiteSession(session_id="my-session")
         >>> compacting_session = LocalCompactionSession(underlying, window_size=100)
         >>> # get_items() returns at most 100 most recent items
+        >>> # For older models:
+        >>> session_gpt4 = LocalCompactionSession(
+        ...     underlying, window_size=100, encoding_name="cl100k_base"
+        ... )
     """
 
-    def __init__(self, session: Session, window_size: int | None = None) -> None:
+    def __init__(
+        self,
+        session: Session,
+        window_size: int | None = None,
+        encoding_name: str = "o200k_base",
+    ) -> None:
         """Initialize the LocalCompactionSession.
 
         Args:
             session: The underlying session to delegate calls to.
             window_size: Maximum number of items to keep in the sliding window.
                          If None, no compaction is applied.
+            encoding_name: Tiktoken encoding name for token counting (default: o200k_base).
+                          Common values: 'o200k_base' (GPT-4o/4.1), 'cl100k_base' (GPT-3.5/4).
         """
         self._session = session
         self._window_size = window_size
         self._cache: list[TResponseInputItem] | None = None
         self._cached_effective_size: int | None = None
 
+        # Initialize tiktoken encoding for token counting
+        if _tiktoken_mod is not None:
+            try:
+                self._tiktoken_encoding: Any = _tiktoken_mod.get_encoding(encoding_name)
+            except Exception as e:
+                logger.warning(
+                    "Failed to load tiktoken encoding '%s': %s. "
+                    "Token counts will use character estimate.",
+                    encoding_name,
+                    e,
+                )
+                self._tiktoken_encoding = None
+        else:
+            self._tiktoken_encoding = None
+
     def _invalidate_cache(self) -> None:
         """Clear the compaction cache, forcing recomputation on next get_items()."""
         if self._cache is not None:
-            logger.debug("[session=%s] Cache invalidated", self._session.session_id)
+            logger.info("[session=%s] Cache invalidated", self._session.session_id)
         self._cache = None
         self._cached_effective_size = None
 
@@ -438,15 +575,21 @@ class LocalCompactionSession(Session):
 
         if effective_size is not None:
             original_count = len(items)
+            # Token counts are logged here to build observability baseline data.
+            # FUTURE: these will drive token-budget compaction (see Token counting helpers above).
+            original_tokens = _count_tokens(items, self._tiktoken_encoding)
             items = boundary_aware_compact(items, effective_size)
             dropped = original_count - len(items)
-            logger.debug(
-                "[session=%s] Compacted %d → %d items (dropped %d, window=%d)",
+            compacted_tokens = _count_tokens(items, self._tiktoken_encoding)
+            logger.info(
+                "[session=%s] Compacted %d → %d items (dropped %d, window=%d) | tokens: %d → %d",
                 self.session_id,
                 original_count,
                 len(items),
                 dropped,
                 effective_size,
+                original_tokens,
+                compacted_tokens,
             )
 
         # NOTE: This call is intentional as a defense-in-depth safety validator.

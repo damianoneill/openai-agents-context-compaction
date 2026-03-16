@@ -1,12 +1,19 @@
 [project]
 name = "openai-agents-context-compaction"
-version = "0.2.0"
+version = "0.2.1"
 description = "Context compaction for the OpenAI Agents SDK Runner loop"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Damian ONeill" }]
 requires-python = ">=3.11"
-keywords = ["openai", "agents", "context", "compaction", "compression", "memory"]
+keywords = [
+    "openai",
+    "agents",
+    "context",
+    "compaction",
+    "compression",
+    "memory",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -16,11 +23,10 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
-dependencies = [
-    "openai-agents>=0.1.0",
-]
+dependencies = ["openai-agents>=0.1.0"]
 
 [project.optional-dependencies]
+tiktoken = ["tiktoken>=0.5.0"]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
@@ -56,6 +62,10 @@ module = ["agents.*"]
 ignore_missing_imports = true
 ignore_errors = true
 
+[[tool.mypy.overrides]]
+module = ["tiktoken.*"]
+ignore_missing_imports = true
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
@@ -65,7 +75,7 @@ select = ["E", "F", "I", "N", "W", "UP"]
 
 [tool.commitizen]
 name = "cz_conventional_commits"
-version = "0.1.0"
+version = "0.2.1"
 tag_format = "v$version"
 version_files = [
     "pyproject.toml:^version",
