@@ -147,23 +147,22 @@ def _extract_text(item: TResponseInputItem) -> str:
         return " ".join(parts)
 
     # user / assistant message: content can be a plain string or a list of content blocks
-    content = item.get("content", "")
+    content = item.get("content")
     if isinstance(content, str):
         parts.append(content)
     elif isinstance(content, list):
         for block in content:
             if isinstance(block, dict):
                 parts.append(block.get("text", ""))
-
-    result = " ".join(parts)
-    if not result and ("type" in item or "role" in item):
+    elif content is None and ("type" in item or "role" in item):
         logger.warning(
-            "Item with type=%r role=%r produced no extractable text "
-            "(may need handler for new API type)",
+            "No content field on item type=%r role=%r. Item: %r",
             item.get("type"),
             item.get("role"),
+            item,
         )
-    return result
+
+    return " ".join(parts)
 
 
 def _count_tokens(items: list[TResponseInputItem], encoding: Any = None) -> int:
@@ -508,7 +507,7 @@ class LocalCompactionSession(Session):
     def _invalidate_cache(self) -> None:
         """Clear the compaction cache, forcing recomputation on next get_items()."""
         if self._cache is not None:
-            logger.debug("[session=%s] Cache invalidated", self._session.session_id)
+            logger.info("[session=%s] Cache invalidated", self._session.session_id)
         self._cache = None
         self._cached_effective_size = None
 
@@ -582,7 +581,7 @@ class LocalCompactionSession(Session):
             items = boundary_aware_compact(items, effective_size)
             dropped = original_count - len(items)
             compacted_tokens = _count_tokens(items, self._tiktoken_encoding)
-            logger.debug(
+            logger.info(
                 "[session=%s] Compacted %d → %d items (dropped %d, window=%d) | tokens: %d → %d",
                 self.session_id,
                 original_count,
