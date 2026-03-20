@@ -334,8 +334,8 @@ class TestLocalCompactionSession:
         single-slot item. This ensures the library doesn't break when OpenAI adds
         new response types.
 
-        Note: logging behaviour (DEBUG message for unknown types) is tested separately
-        in test_unknown_item_types_debug_log so that a wording change in the log
+        Note: logging behaviour (WARNING for unknown types) is tested separately
+        in test_unknown_item_types_warning_log so that a wording change in the log
         message doesn't mask a regression in the behavioural assertion here.
         """
         mock = MockSession()
@@ -351,23 +351,24 @@ class TestLocalCompactionSession:
         assert valid_msg in items
 
     @pytest.mark.asyncio
-    async def test_unknown_item_types_debug_log(self, caplog: pytest.LogCaptureFixture) -> None:
-        """Unknown item types emit a DEBUG log during compaction.
+    async def test_unknown_item_types_warning_log(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Unknown item types emit a WARNING log during compaction.
 
         Kept separate from the behavioural test so a log wording change doesn't
-        obscure whether the item was actually preserved.
+        obscure whether the item was actually preserved. WARNING level ensures
+        operators see this in production without enabling debug logging.
         """
         mock = MockSession()
         unknown_item = {"type": "future_reasoning_item", "content": "thinking..."}
         await mock.add_items([user_msg("older"), unknown_item, user_msg("valid message")])
         compacting = LocalCompactionSession(mock, window_size=2)
 
-        with caplog.at_level(logging.DEBUG, logger="openai_agents_context_compaction.session"):
+        with caplog.at_level(logging.WARNING, logger="openai_agents_context_compaction.session"):
             await compacting.get_items()
 
         assert any(
             "unknown item type encountered" in record.message.lower() for record in caplog.records
-        ), "Expected debug log about unknown item type"
+        ), "Expected warning log about unknown item type"
 
     @pytest.mark.asyncio
     async def test_order_preserved_with_interleaved_messages(self) -> None:
@@ -579,3 +580,20 @@ class TestCustomTokenCounter:
         # Should still log compaction but without token counts
         assert any("Compacted" in r.message for r in caplog.records)
         assert not any("tokens:" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_get_items_returns_independent_copy(self) -> None:
+        """Mutating the list returned by get_items() must not affect subsequent calls.
+
+        The cache was removed, but the contract that callers receive an independent
+        list still holds — drop_orphaned_tool_outputs returns a new list each time.
+        """
+        mock = MockSession()
+        await mock.add_items([user_msg("a"), user_msg("b")])
+        compacting = LocalCompactionSession(mock, window_size=10)
+
+        result1 = await compacting.get_items()
+        result1.clear()  # mutate the returned list
+
+        result2 = await compacting.get_items()
+        assert len(result2) == 2, "Mutating a returned list must not affect subsequent calls"

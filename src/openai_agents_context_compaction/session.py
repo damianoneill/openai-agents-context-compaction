@@ -353,7 +353,7 @@ def _boundary_aware_compact_with_indices(
             continue
 
         if budget > 0:
-            logger.debug(
+            logger.warning(
                 "Unknown item type encountered: %r. Including as single item.",
                 current_item.get("type"),
             )
@@ -481,7 +481,7 @@ class LocalCompactionSession(Session):
 
     Note:
         This wrapper deliberately does **not** cache compaction results.
-        The underlying session may be backed by a shared store (e.g., Postgres)
+        The underlying session may be backed by a shared database
         with multiple application servers writing concurrently. An in-process
         cache would go stale when another server modifies the session.
 
@@ -540,23 +540,22 @@ class LocalCompactionSession(Session):
 
         if token_counter is None:
             logger.info("[session=%s] Token counting disabled", session.session_id)
-        elif isinstance(token_counter, DefaultTokenCounter):
-            logger.info(
-                "[session=%s] Token counting: ~4 chars/token estimate",
-                session.session_id,
-            )
-        elif isinstance(token_counter, TiktokenCounter):
-            logger.info(
-                "[session=%s] Token counting: tiktoken (%s) — "
-                "optimised for OpenAI models (GPT-4o, GPT-4.1, etc.)",
-                session.session_id,
-                token_counter.encoding_name,
-            )
         else:
-            logger.info(
-                "[session=%s] Token counting: custom counter",
-                session.session_id,
-            )
+            encoding = getattr(token_counter, "encoding_name", None)
+            counter_name = type(token_counter).__name__
+            if encoding:
+                logger.info(
+                    "[session=%s] Token counting: %s (%s)",
+                    session.session_id,
+                    counter_name,
+                    encoding,
+                )
+            else:
+                logger.info(
+                    "[session=%s] Token counting: %s",
+                    session.session_id,
+                    counter_name,
+                )
 
     @property
     def session_id(self) -> str:
@@ -622,7 +621,10 @@ class LocalCompactionSession(Session):
             dropped = original_count - len(items)
 
             if self._token_counter is not None and item_tokens_by_index is not None:
-                # Sum tokens for kept indices — robust position-based approach
+                # Sum tokens for kept indices. Note: drop_orphaned_tool_outputs runs
+                # after this and may remove additional items, so compacted_tokens can
+                # be slightly inflated if orphans are present. Intentional approximation
+                # — this is observability only, not a correctness concern.
                 compacted_tokens = sum(item_tokens_by_index[i] for i in kept_indices)
                 token_reduction_pct = (
                     (original_tokens - compacted_tokens) / original_tokens * 100
