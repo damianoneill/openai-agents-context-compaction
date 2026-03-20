@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from unittest.mock import patch
 
 import pytest
 from agents import Session, TResponseInputItem
@@ -35,18 +34,6 @@ class MockSession(Session):
 
     async def clear_session(self) -> None:
         self._items.clear()
-
-
-class CountingMockSession(MockSession):
-    """MockSession that counts get_items calls to verify caching."""
-
-    def __init__(self, session_id: str = "test-session") -> None:
-        super().__init__(session_id)
-        self.get_items_call_count = 0
-
-    async def get_items(self, limit: int | None = None) -> list[TResponseInputItem]:
-        self.get_items_call_count += 1
-        return await super().get_items(limit)
 
 
 # -------------------------------------------------------------------
@@ -149,6 +136,10 @@ class TestLocalCompactionSession:
         compacting = LocalCompactionSession(mock, window_size=window_size)
         items = await compacting.get_items()
         self._validate_invariants(items)
+
+        # window_size=0 must return empty list
+        if window_size == 0:
+            assert items == [], "window_size=0 should return empty list"
 
         # Verify window size is respected (with soft limit exception for fc pairs)
         # window_size=1 may be exceeded by fc pairs (size 2) — that's by design
@@ -335,36 +326,50 @@ class TestLocalCompactionSession:
         assert "42" in r
 
     @pytest.mark.asyncio
-    async def test_unknown_item_types_preserved_with_warning(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Unknown item types are preserved (with warning) for forward compatibility.
+    async def test_unknown_item_types_preserved(self) -> None:
+        """Unknown item types are kept as independent atomic items (forward compatibility).
 
         The Responses API may add new item types (e.g., reasoning, file_search_call).
-        Rather than silently dropping them, we:
-        - Log a warning about the unknown type
-        - Keep the item as a single item
+        Rather than silently dropping them, we keep the item and treat it as a
+        single-slot item. This ensures the library doesn't break when OpenAI adds
+        new response types.
 
-        This ensures forward compatibility when OpenAI adds new response types.
+        Note: logging behaviour (DEBUG message for unknown types) is tested separately
+        in test_unknown_item_types_debug_log so that a wording change in the log
+        message doesn't mask a regression in the behavioural assertion here.
         """
         mock = MockSession()
         unknown_item = {"type": "future_reasoning_item", "content": "thinking..."}
         valid_msg = user_msg("valid message")
-        # Need more items than window_size to trigger compaction where warning is logged
         await mock.add_items([user_msg("older"), unknown_item, valid_msg])
         compacting = LocalCompactionSession(mock, window_size=2)
 
-        with caplog.at_level(logging.WARNING, logger="openai_agents_context_compaction.session"):
-            items = await compacting.get_items()
+        items = await compacting.get_items()
 
-        # Unknown item and most recent valid message should be preserved
         assert len(items) == 2
         assert unknown_item in items
         assert valid_msg in items
-        # Warning should be logged about unknown type
+
+    @pytest.mark.asyncio
+    async def test_unknown_item_types_debug_log(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Unknown item types emit a DEBUG log during compaction.
+
+        Kept separate from the behavioural test so a log wording change doesn't
+        obscure whether the item was actually preserved.
+        """
+        mock = MockSession()
+        unknown_item = {"type": "future_reasoning_item", "content": "thinking..."}
+        await mock.add_items([user_msg("older"), unknown_item, user_msg("valid message")])
+        compacting = LocalCompactionSession(mock, window_size=2)
+
+        with caplog.at_level(logging.DEBUG, logger="openai_agents_context_compaction.session"):
+            await compacting.get_items()
+
         assert any(
             "unknown item type encountered" in record.message.lower() for record in caplog.records
-        ), "Expected warning about unknown item type"
+        ), "Expected debug log about unknown item type"
 
     @pytest.mark.asyncio
     async def test_order_preserved_with_interleaved_messages(self) -> None:
@@ -452,94 +457,6 @@ class TestLocalCompactionSession:
             )
 
 
-class TestCompactionCaching:
-    """Tests for the compaction result cache in LocalCompactionSession.
-
-    Within a single agent turn, get_items() may be called multiple times
-    (guardrails, retries, handoffs). The cache avoids redundant O(n) compaction.
-    """
-
-    @pytest.mark.asyncio
-    async def test_cache_hit_avoids_repeated_underlying_calls(self) -> None:
-        """Repeated get_items() with same params should use cached result."""
-        mock = CountingMockSession()
-        await mock.add_items([user_msg("a"), user_msg("b"), user_msg("c")])
-        compacting = LocalCompactionSession(mock, window_size=2)
-
-        result1 = await compacting.get_items()
-        assert mock.get_items_call_count == 1
-
-        result2 = await compacting.get_items()
-        assert mock.get_items_call_count == 1, "Cache hit should not call underlying get_items"
-
-        result3 = await compacting.get_items()
-        assert mock.get_items_call_count == 1, "Subsequent hits should still use cache"
-
-        assert result1 == result2 == result3
-        # Results should be copies (not the same list object)
-        assert result1 is not result2
-        assert result2 is not result3
-
-    @pytest.mark.asyncio
-    async def test_cache_returns_copy_preventing_mutation(self) -> None:
-        """Mutating a returned list must not affect cached data."""
-        mock = MockSession()
-        await mock.add_items([user_msg("a"), user_msg("b")])
-        compacting = LocalCompactionSession(mock, window_size=5)
-
-        result1 = await compacting.get_items()
-        result1.clear()  # mutate the returned list
-
-        result2 = await compacting.get_items()
-        assert len(result2) == 2, "Cache should not be affected by caller mutation"
-
-    @pytest.mark.asyncio
-    async def test_add_items_invalidates_cache(self) -> None:
-        """Adding items must invalidate the cache so underlying is re-fetched."""
-        mock = CountingMockSession()
-        await mock.add_items([user_msg("a")])
-        compacting = LocalCompactionSession(mock, window_size=10)
-
-        result1 = await compacting.get_items()
-        assert len(result1) == 1
-        assert mock.get_items_call_count == 1
-
-        await compacting.add_items([user_msg("b")])
-        result2 = await compacting.get_items()
-        assert len(result2) == 2
-        assert mock.get_items_call_count == 2, "Write must invalidate cache, triggering re-fetch"
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("method,expected_after", [("pop_item", 1), ("clear_session", 0)])
-    async def test_mutating_methods_invalidate_cache(
-        self, method: str, expected_after: int
-    ) -> None:
-        """pop_item and clear_session must invalidate the cache."""
-        mock = MockSession()
-        await mock.add_items([user_msg("a"), user_msg("b")])
-        compacting = LocalCompactionSession(mock, window_size=10)
-
-        result1 = await compacting.get_items()
-        assert len(result1) == 2
-
-        await getattr(compacting, method)()
-        result2 = await compacting.get_items()
-        assert len(result2) == expected_after
-
-    @pytest.mark.asyncio
-    async def test_different_limit_bypasses_cache(self) -> None:
-        """Calling get_items() with a different limit must recompute."""
-        mock = MockSession()
-        await mock.add_items([user_msg("a"), user_msg("b"), user_msg("c")])
-        compacting = LocalCompactionSession(mock, window_size=None)
-
-        result1 = await compacting.get_items(limit=2)
-        result2 = await compacting.get_items(limit=3)
-
-        assert len(result1) == 2
-        assert len(result2) == 3
-
-
 # -------------------------------------------------------------------
 # Token counting tests
 # -------------------------------------------------------------------
@@ -604,14 +521,63 @@ class TestCountTokens:
         assert two == one * 2
 
     def test_fallback_tiny_text_nonzero(self) -> None:
-        # Test fallback token counting for very short strings (edge case: single char).
-        # Mock _default_encoding to None to force fallback execution regardless of whether
-        # tiktoken is installed in the test environment.
-        with patch("openai_agents_context_compaction.session._default_encoding", None):
-            result = _count_tokens([user_msg("x")])
-            # Fallback: max(1, len("x")//4) + 4
-            #         = max(1, 1//4) + 4
-            #         = max(1, 0) + 4  [without max(1, ...) this would be 0]
-            #         = 1 + 4
-            #         = 5
-            assert result > 4
+        # Test default token counting for very short strings (edge case: single char).
+        # Default uses max(1, len(text)//4) + 4 overhead.
+        result = _count_tokens([user_msg("x")])
+        # Default: max(1, len("x")//4) + 4
+        #        = max(1, 1//4) + 4
+        #        = max(1, 0) + 4
+        #        = 1 + 4
+        #        = 5
+        assert result == 5
+
+    def test_custom_token_counter(self) -> None:
+        """A user-supplied token_counter callable is used instead of the default."""
+
+        # Simple counter: 1 token per word
+        def word_counter(text: str) -> int:
+            return len(text.split())
+
+        result = _count_tokens([user_msg("one two three")], token_counter=word_counter)
+        # 3 words + 4 overhead = 7
+        assert result == 7
+
+
+class TestCustomTokenCounter:
+    """Tests for pluggable token_counter on LocalCompactionSession."""
+
+    @pytest.mark.asyncio
+    async def test_custom_counter_used_in_logging(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A custom token_counter is invoked during compaction logging."""
+        call_count = 0
+
+        def counting_counter(text: str) -> int:
+            nonlocal call_count
+            call_count += 1
+            return len(text)  # 1 token per char
+
+        mock = MockSession()
+        await mock.add_items([user_msg(f"msg{i}") for i in range(5)])
+        compacting = LocalCompactionSession(mock, window_size=3, token_counter=counting_counter)
+
+        with caplog.at_level(logging.INFO, logger="openai_agents_context_compaction.session"):
+            await compacting.get_items()
+
+        assert call_count > 0, "Custom token_counter must be called during compaction"
+        assert any("tokens:" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_token_counter_none_disables_counting(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Passing token_counter=None disables token counting in log output."""
+        mock = MockSession()
+        await mock.add_items([user_msg(f"msg{i}") for i in range(5)])
+        compacting = LocalCompactionSession(mock, window_size=3, token_counter=None)
+
+        with caplog.at_level(logging.INFO, logger="openai_agents_context_compaction.session"):
+            await compacting.get_items()
+
+        # Should still log compaction but without token counts
+        assert any("Compacted" in r.message for r in caplog.records)
+        assert not any("tokens:" in r.message for r in caplog.records)

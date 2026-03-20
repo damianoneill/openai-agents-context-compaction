@@ -78,40 +78,58 @@ from the end and work back until we've filled the window.
 from __future__ import annotations
 
 import logging
-import warnings
-from typing import Any
+from collections.abc import Callable
+from typing import TypedDict
 
 from agents import Session, TResponseInputItem
 
-_tiktoken_mod: Any = None
-_default_encoding: Any = None
-
-try:
-    import tiktoken
-
-    _tiktoken_mod = tiktoken
-    _default_encoding = tiktoken.get_encoding("o200k_base")
-except ImportError:
-    _tiktoken_mod = None
-    _default_encoding = None
-    warnings.warn(
-        "tiktoken is not installed; token counts will use a ~4 chars/token estimate. "
-        "For accurate counts: pip install 'openai-agents-context-compaction[tiktoken]'",
-        UserWarning,
-        stacklevel=1,
-    )
-except Exception as exc:
-    _default_encoding = None
-    warnings.warn(
-        f"tiktoken failed to load encoding ({exc}); "
-        "token counts will use a ~4 chars/token estimate. "
-        "This may be a network error downloading the vocabulary file on first use.",
-        RuntimeWarning,
-        stacklevel=1,
-    )
-
 # NOTE: Verbose DEBUG logging is intentional during alpha; callers control via logging config.
 logger = logging.getLogger(__name__)
+
+
+class DefaultTokenCounter:
+    """Default token counter: ~4 chars/token estimate (model-agnostic).
+
+    Used when no token_counter is specified. Provides a rough estimate
+    suitable for observability without requiring tiktoken.
+    """
+
+    def __call__(self, text: str) -> int:
+        """Count tokens using ~4 chars/token estimate."""
+        return max(1, len(text) // 4)
+
+
+# Singleton instance for default parameter
+_default_token_counter = DefaultTokenCounter()
+
+
+class TiktokenCounter:
+    """Token counter using tiktoken (requires ``pip install tiktoken``).
+
+    Args:
+        encoding_name: Tiktoken encoding name. Common values:
+            'o200k_base' (GPT-4o/4.1), 'cl100k_base' (GPT-3.5/4).
+
+    Raises:
+        ImportError: If tiktoken is not installed.
+        ValueError: If ``encoding_name`` is not a recognised tiktoken encoding.
+        RuntimeError: If tiktoken fails to download the vocabulary file on first
+            use (e.g. network unavailable in an air-gapped environment).
+
+    Example:
+        >>> counter = TiktokenCounter("o200k_base")
+        >>> session = LocalCompactionSession(underlying, token_counter=counter)
+    """
+
+    def __init__(self, encoding_name: str = "o200k_base") -> None:
+        import tiktoken
+
+        self.encoding_name = encoding_name
+        self._enc = tiktoken.get_encoding(encoding_name)
+
+    def __call__(self, text: str) -> int:
+        """Count tokens in text."""
+        return len(self._enc.encode(text))
 
 
 # =============================================================================
@@ -153,7 +171,14 @@ def _extract_text(item: TResponseInputItem) -> str:
     elif isinstance(content, list):
         for block in content:
             if isinstance(block, dict):
-                parts.append(block.get("text", ""))
+                if "text" in block:
+                    parts.append(block["text"])
+                elif "input_text" in block:
+                    parts.append(block["input_text"])
+                elif "output_text" in block:
+                    parts.append(block["output_text"])
+                else:
+                    logger.debug("Unknown content block shape: %r", block)
     elif content is None and ("type" in item or "role" in item):
         logger.warning(
             "No content field on item type=%r role=%r. Item: %r",
@@ -165,31 +190,28 @@ def _extract_text(item: TResponseInputItem) -> str:
     return " ".join(parts)
 
 
-def _count_tokens(items: list[TResponseInputItem], encoding: Any = None) -> int:
+def _count_tokens(
+    items: list[TResponseInputItem],
+    token_counter: Callable[[str], int] = _default_token_counter,
+) -> int:
     """Estimate total token count for a list of Responses API items.
 
-    Uses tiktoken with the provided encoding (defaults to o200k_base for GPT-4o/4.1)
-    when available. Falls back to a character-based estimate (~4 chars per token)
-    if tiktoken is not installed or encoding is None. Each item carries a +4 overhead
-    to account for message-structure tokens (role, separators, etc.).
+    Each item's text is passed to ``token_counter`` to get raw token count,
+    then a +4 overhead is added per item for message-structure tokens
+    (role, separators, etc.).
 
     Args:
         items: List of Responses API items to count tokens for.
-        encoding: Optional tiktoken encoding instance. If None, uses the module default.
+        token_counter: A callable that maps text to a token count.
+            Defaults to ~4 chars/token estimate (model-agnostic).
 
     Returns:
         Estimated total token count.
     """
-    if encoding is None:
-        encoding = _default_encoding
-
     total = 0
     for item in items:
         text = _extract_text(item)
-        if encoding is not None:
-            total += len(encoding.encode(text)) + 4
-        else:
-            total += max(1, len(text) // 4) + 4
+        total += token_counter(text) + 4
     return total
 
 
@@ -224,6 +246,124 @@ def _is_conversation_message(item: TResponseInputItem) -> bool:
     return item.get("role") in ("user", "assistant")
 
 
+class _CallIndices(TypedDict):
+    """Indices for a function call pair (call and output).
+
+    Used internally by _boundary_aware_compact to track positions.
+    Values are None until filled during index mapping; only entries
+    where both are int make it into complete_pairs.
+    """
+
+    call: int | None
+    output: int | None
+
+
+def _boundary_aware_compact_with_indices(
+    items: list[TResponseInputItem],
+    window_size: int,
+) -> tuple[list[TResponseInputItem], list[int]]:
+    """Internal: compact history and return both items and their original indices.
+
+    Returns:
+        Tuple of (compacted_items, kept_indices) where kept_indices are the
+        original positions of the kept items.
+    """
+    if window_size <= 0:
+        return [], []
+
+    if len(items) <= window_size:
+        # All items fit — return as-is with all indices
+        return list(items), list(range(len(items)))
+
+    # Build call_id -> indices map
+    call_to_indices: dict[str, _CallIndices] = {}
+
+    for idx, item in enumerate(items):
+        call_id = _get_call_id(item)
+        if call_id is None:
+            continue
+
+        if call_id not in call_to_indices:
+            call_to_indices[call_id] = {"call": None, "output": None}
+
+        if _is_function_call(item):
+            if call_to_indices[call_id]["call"] is not None:
+                logger.debug("Duplicate function_call call_id=%s (overwriting)", call_id)
+            call_to_indices[call_id]["call"] = idx
+        elif _is_function_call_output(item):
+            if call_to_indices[call_id]["output"] is not None:
+                logger.debug("Duplicate function_call_output call_id=%s (overwriting)", call_id)
+            call_to_indices[call_id]["output"] = idx
+
+    # Identify complete pairs
+    complete_pairs: dict[str, tuple[int, int]] = {}
+    for call_id, indices in call_to_indices.items():
+        if indices["call"] is not None and indices["output"] is not None:
+            complete_pairs[call_id] = (indices["call"], indices["output"])
+
+    # Walk backwards, marking indices
+    included_indices: set[int] = set()
+    required_call_ids: set[str] = set()
+    budget = window_size
+
+    for idx in range(len(items) - 1, -1, -1):
+        current_item = items[idx]
+
+        if _is_function_call_output(current_item):
+            call_id = _get_call_id(current_item)
+            if call_id and call_id in complete_pairs:
+                if budget >= 2:
+                    included_indices.add(idx)
+                    call_idx = complete_pairs[call_id][0]
+                    included_indices.add(call_idx)
+                    required_call_ids.add(call_id)
+                    budget -= 2
+                elif not included_indices:
+                    logger.debug(
+                        "Window size %d smaller than function call pair size 2, "
+                        "keeping pair anyway",
+                        window_size,
+                    )
+                    included_indices.add(idx)
+                    call_idx = complete_pairs[call_id][0]
+                    included_indices.add(call_idx)
+                    required_call_ids.add(call_id)
+                    budget = 0
+                else:
+                    logger.debug(
+                        "Skipping function call pair call_id=%s: budget %d < 2",
+                        call_id,
+                        budget,
+                    )
+            else:
+                logger.debug("Dropping orphaned function_call_output with call_id=%s", call_id)
+            continue
+
+        if _is_function_call(current_item):
+            call_id = _get_call_id(current_item)
+            if call_id and call_id in required_call_ids:
+                continue
+            logger.debug("Dropping orphaned function_call with call_id=%s", call_id)
+            continue
+
+        if _is_conversation_message(current_item):
+            if budget > 0:
+                included_indices.add(idx)
+                budget -= 1
+            continue
+
+        if budget > 0:
+            logger.debug(
+                "Unknown item type encountered: %r. Including as single item.",
+                current_item.get("type"),
+            )
+            included_indices.add(idx)
+            budget -= 1
+
+    sorted_indices = sorted(included_indices)
+    return [items[i] for i in sorted_indices], sorted_indices
+
+
 def boundary_aware_compact(
     items: list[TResponseInputItem],
     window_size: int,
@@ -253,8 +393,8 @@ def boundary_aware_compact(
     - window_size=1: most recent single message kept; function call pairs (needing 2 slots)
       are skipped unless they're the only thing available (soft limit to avoid empty result)
     - Function call pairs that don't fit the budget are dropped entirely
-    - Orphaned function_call (no output) is dropped
-    - Orphaned function_call_output (no call) is dropped
+    - Orphaned function_call (no output) is dropped during backward walk
+    - Orphaned function_call_output (no call) is dropped during backward walk
 
     Args:
         items: List of conversation items to compact (Responses API format).
@@ -263,122 +403,8 @@ def boundary_aware_compact(
     Returns:
         Compacted list of items with function call pairs preserved, in original order.
     """
-    if window_size <= 0:
-        return []
-
-    if len(items) <= window_size:
-        return drop_orphaned_tool_outputs(items)
-
-    # =========================================================================
-    # STEP 1: Build a map of call_id -> (function_call_index, function_call_output_index)
-    # This allows us to identify complete pairs
-    # NOTE: call_id is assumed unique per type (SDK invariant). Duplicates overwrite.
-    # =========================================================================
-    call_to_indices: dict[str, dict[str, int | None]] = {}
-
-    for idx, item in enumerate(items):
-        call_id = _get_call_id(item)
-        if call_id is None:
-            continue
-
-        if call_id not in call_to_indices:
-            call_to_indices[call_id] = {"call": None, "output": None}
-
-        if _is_function_call(item):
-            call_to_indices[call_id]["call"] = idx
-        elif _is_function_call_output(item):
-            call_to_indices[call_id]["output"] = idx
-
-    # Identify complete pairs (both call and output present)
-    complete_pairs: dict[str, tuple[int, int]] = {}
-    for call_id, indices in call_to_indices.items():
-        if indices["call"] is not None and indices["output"] is not None:
-            complete_pairs[call_id] = (indices["call"], indices["output"])
-
-    # =========================================================================
-    # STEP 2: Walk backwards, marking indices to include while tracking budget
-    # Budget represents remaining window capacity. Including a complete pair
-    # costs 2 from the budget (reserved upfront when the output is encountered).
-    # =========================================================================
-    included_indices: set[int] = set()
-    required_call_ids: set[str] = set()  # call_ids whose function_call we must include
-    budget = window_size
-
-    for idx in range(len(items) - 1, -1, -1):
-        current_item = items[idx]
-
-        # ----- CASE A: function_call_output -----
-        if _is_function_call_output(current_item):
-            call_id = _get_call_id(current_item)
-
-            if call_id and call_id in complete_pairs:
-                if budget >= 2:
-                    # Reserve budget for both output AND its matching call
-                    included_indices.add(idx)
-                    call_idx = complete_pairs[call_id][0]
-                    included_indices.add(call_idx)
-                    required_call_ids.add(call_id)
-                    budget -= 2
-                elif not included_indices:
-                    # Soft limit: nothing included yet, so this pair is the most
-                    # recent actionable content. Keep it to avoid returning
-                    # empty/stale data even though it exceeds window_size.
-                    logger.debug(
-                        "Window size %d smaller than function call pair size 2, "
-                        "keeping pair anyway",
-                        window_size,
-                    )
-                    included_indices.add(idx)
-                    call_idx = complete_pairs[call_id][0]
-                    included_indices.add(call_idx)
-                    required_call_ids.add(call_id)
-                    budget = 0  # prevent further inclusions
-                else:
-                    # Not enough budget for the pair — skip entirely
-                    logger.debug(
-                        "Skipping function call pair call_id=%s: budget %d < 2",
-                        call_id,
-                        budget,
-                    )
-            else:
-                # Orphaned output (no matching call) - skip
-                logger.debug("Dropping orphaned function_call_output with call_id=%s", call_id)
-            continue
-
-        # ----- CASE B: function_call -----
-        if _is_function_call(current_item):
-            call_id = _get_call_id(current_item)
-
-            if call_id and call_id in required_call_ids:
-                # Already marked and budgeted when we processed its output — skip
-                continue
-
-            # Orphaned function_call (no output, or pair wasn't selected) - skip
-            logger.debug("Dropping orphaned function_call with call_id=%s", call_id)
-            continue
-
-        # ----- CASE C: Normal message (user/assistant) -----
-        if _is_conversation_message(current_item):
-            if budget > 0:
-                included_indices.add(idx)
-                budget -= 1
-            continue
-
-        # ----- CASE D: Unknown item type -----
-        # Treat as single item to preserve future Responses API types
-        # (e.g. reasoning, file_search_call) rather than silently dropping them.
-        if budget > 0:
-            logger.warning(
-                "Unknown item type encountered: %r. Including as single item.",
-                current_item.get("type"),
-            )
-            included_indices.add(idx)
-            budget -= 1
-
-    # =========================================================================
-    # STEP 3: Collect items in original chronological order
-    # =========================================================================
-    return [items[i] for i in sorted(included_indices)]
+    compacted_items, _ = _boundary_aware_compact_with_indices(items, window_size)
+    return drop_orphaned_tool_outputs(compacted_items)
 
 
 def drop_orphaned_tool_outputs(
@@ -439,7 +465,9 @@ def drop_orphaned_tool_outputs(
                 )
             continue
 
-        # Normal message - always keep
+        # Normal message or unknown type — always keep.
+        # NOTE: Unknown types bypass validation; if future types introduce relationships
+        # (like function call pairs), they'll need explicit handling here.
         cleaned.append(item)
 
     return cleaned
@@ -451,21 +479,43 @@ class LocalCompactionSession(Session):
     Write operations delegate directly; `get_items` can limit results to
     the last `window_size` items.
 
+    Note:
+        This wrapper deliberately does **not** cache compaction results.
+        The underlying session may be backed by a shared store (e.g., Postgres)
+        with multiple application servers writing concurrently. An in-process
+        cache would go stale when another server modifies the session.
+
     Args:
         session: The underlying session to wrap.
         window_size: Max items to keep when retrieving. None disables compaction.
-        encoding_name: Tiktoken encoding name for token counting (default: o200k_base
-                       for GPT-4o/4.1). Common values: 'o200k_base' (GPT-4o/4.1),
-                       'cl100k_base' (GPT-3.5/4). Ignored if tiktoken not installed.
+            **Soft limit**: may be exceeded by 1 item to preserve atomic function
+            call pairs (a pair requires 2 slots; if window_size=1 and the most
+            recent item is a function_call_output, both call and output are kept).
+        token_counter: A callable ``(str) -> int`` used to estimate token counts
+            for observability logging. Defaults to a ~4 chars/token estimate
+            (model-agnostic). Pass ``None`` to disable token counting entirely.
+            For accurate OpenAI counts, use ``TiktokenCounter()``.
+            For other models (e.g. Anthropic Claude), supply a tokenizer via the provider SDK.
 
     Example:
         >>> from agents import SQLiteSession
         >>> underlying = SQLiteSession(session_id="my-session")
         >>> compacting_session = LocalCompactionSession(underlying, window_size=100)
         >>> # get_items() returns at most 100 most recent items
-        >>> # For older models:
-        >>> session_gpt4 = LocalCompactionSession(
-        ...     underlying, window_size=100, encoding_name="cl100k_base"
+        >>> # For accurate OpenAI token counts:
+        >>> from openai_agents_context_compaction import TiktokenCounter
+        >>> session_oai = LocalCompactionSession(
+        ...     underlying, window_size=100, token_counter=TiktokenCounter(),
+        ... )
+        >>> # For non-OpenAI models, define a token counter function:
+        >>> def my_token_counter(text: str) -> int:
+        ...     return client.count_tokens(text, model="claude-sonnet-4-20250514")
+        >>> session = LocalCompactionSession(
+        ...     underlying, window_size=100, token_counter=my_token_counter,
+        ... )
+        >>> # To disable token counting entirely:
+        >>> session_no_tokens = LocalCompactionSession(
+        ...     underlying, window_size=100, token_counter=None,
         ... )
     """
 
@@ -473,7 +523,7 @@ class LocalCompactionSession(Session):
         self,
         session: Session,
         window_size: int | None = None,
-        encoding_name: str = "o200k_base",
+        token_counter: Callable[[str], int] | None = _default_token_counter,
     ) -> None:
         """Initialize the LocalCompactionSession.
 
@@ -481,35 +531,32 @@ class LocalCompactionSession(Session):
             session: The underlying session to delegate calls to.
             window_size: Maximum number of items to keep in the sliding window.
                          If None, no compaction is applied.
-            encoding_name: Tiktoken encoding name for token counting (default: o200k_base).
-                          Common values: 'o200k_base' (GPT-4o/4.1), 'cl100k_base' (GPT-3.5/4).
+            token_counter: Callable that maps text to token count for logging.
+                          Defaults to ~4 chars/token. Pass None to disable.
         """
         self._session = session
         self._window_size = window_size
-        self._cache: list[TResponseInputItem] | None = None
-        self._cached_effective_size: int | None = None
+        self._token_counter = token_counter
 
-        # Initialize tiktoken encoding for token counting
-        if _tiktoken_mod is not None:
-            try:
-                self._tiktoken_encoding: Any = _tiktoken_mod.get_encoding(encoding_name)
-            except Exception as e:
-                logger.warning(
-                    "Failed to load tiktoken encoding '%s': %s. "
-                    "Token counts will use character estimate.",
-                    encoding_name,
-                    e,
-                )
-                self._tiktoken_encoding = None
+        if token_counter is None:
+            logger.info("[session=%s] Token counting disabled", session.session_id)
+        elif isinstance(token_counter, DefaultTokenCounter):
+            logger.info(
+                "[session=%s] Token counting: ~4 chars/token estimate",
+                session.session_id,
+            )
+        elif isinstance(token_counter, TiktokenCounter):
+            logger.info(
+                "[session=%s] Token counting: tiktoken (%s) — "
+                "optimised for OpenAI models (GPT-4o, GPT-4.1, etc.)",
+                session.session_id,
+                token_counter.encoding_name,
+            )
         else:
-            self._tiktoken_encoding = None
-
-    def _invalidate_cache(self) -> None:
-        """Clear the compaction cache, forcing recomputation on next get_items()."""
-        if self._cache is not None:
-            logger.info("[session=%s] Cache invalidated", self._session.session_id)
-        self._cache = None
-        self._cached_effective_size = None
+            logger.info(
+                "[session=%s] Token counting: custom counter",
+                session.session_id,
+            )
 
     @property
     def session_id(self) -> str:
@@ -550,56 +597,65 @@ class LocalCompactionSession(Session):
         else:
             effective_size = None
 
-        # Return cached result if compaction parameters haven't changed
-        if self._cache is not None and self._cached_effective_size == effective_size:
-            logger.debug(
-                "[session=%s] Cache hit (effective_size=%s, cached_items=%d)",
-                self.session_id,
-                effective_size,
-                len(self._cache),
-            )
-            return list(self._cache)  # Copy to prevent caller mutation
-
-        logger.debug(
-            "[session=%s] Cache miss (effective_size=%s, previous=%s)",
-            self.session_id,
-            effective_size,
-            self._cached_effective_size,
-        )
-
-        # NOTE: We always fetch ALL items from the underlying session, ignoring
-        # its `limit` parameter, because boundary-aware compaction needs the full
-        # history to correctly identify and preserve function call pairs. This means
-        # memory usage scales with total session size, not window_size.
+        # Fetch from underlying — needed for compaction
+        # NOTE: We fetch ALL items because boundary-aware compaction needs the full
+        # history to correctly identify and preserve function call pairs.
         items = await self._session.get_items()
 
         if effective_size is not None:
             original_count = len(items)
             # Token counts are logged here to build observability baseline data.
             # FUTURE: these will drive token-budget compaction (see Token counting helpers above).
-            original_tokens = _count_tokens(items, self._tiktoken_encoding)
-            items = boundary_aware_compact(items, effective_size)
+            # Compute tokens by position (index) — robust even if compaction copies items.
+            item_tokens_by_index: list[int] | None = None
+            original_tokens = 0
+            if self._token_counter is not None:
+                item_tokens_by_index = []
+                for item in items:
+                    text = _extract_text(item)
+                    tokens = self._token_counter(text) + 4
+                    item_tokens_by_index.append(tokens)
+                original_tokens = sum(item_tokens_by_index)
+
+            # Use internal function to get both items and their original indices
+            items, kept_indices = _boundary_aware_compact_with_indices(items, effective_size)
             dropped = original_count - len(items)
-            compacted_tokens = _count_tokens(items, self._tiktoken_encoding)
-            logger.info(
-                "[session=%s] Compacted %d → %d items (dropped %d, window=%d) | tokens: %d → %d",
-                self.session_id,
-                original_count,
-                len(items),
-                dropped,
-                effective_size,
-                original_tokens,
-                compacted_tokens,
-            )
+
+            if self._token_counter is not None and item_tokens_by_index is not None:
+                # Sum tokens for kept indices — robust position-based approach
+                compacted_tokens = sum(item_tokens_by_index[i] for i in kept_indices)
+                token_reduction_pct = (
+                    (original_tokens - compacted_tokens) / original_tokens * 100
+                    if original_tokens > 0
+                    else 0.0
+                )
+                logger.info(
+                    "[session=%s] Compacted %d → %d items"
+                    " (dropped %d, window=%d) | tokens: %d → %d (%.1f%% reduction)",
+                    self.session_id,
+                    original_count,
+                    len(items),
+                    dropped,
+                    effective_size,
+                    original_tokens,
+                    compacted_tokens,
+                    token_reduction_pct,
+                )
+            else:
+                logger.info(
+                    "[session=%s] Compacted %d → %d items (dropped %d, window=%d)",
+                    self.session_id,
+                    original_count,
+                    len(items),
+                    dropped,
+                    effective_size,
+                )
 
         # NOTE: This call is intentional as a defense-in-depth safety validator.
         # It ensures that any edge cases missed by boundary_aware_compact are caught.
-        items = drop_orphaned_tool_outputs(items)
-
-        # Cache the result for subsequent calls within the same turn
-        self._cache = items
-        self._cached_effective_size = effective_size
-        return list(items)  # Copy to prevent caller mutation
+        # Runs even when no compaction happened (len(items) <= window_size) because
+        # orphans could exist in the source data regardless of compaction.
+        return drop_orphaned_tool_outputs(items)
 
     async def add_items(self, items: list[TResponseInputItem]) -> None:
         """Add new items to the underlying session's conversation history.
@@ -607,7 +663,6 @@ class LocalCompactionSession(Session):
         Args:
             items: List of input items to add to the history.
         """
-        self._invalidate_cache()
         await self._session.add_items(items)
 
     async def pop_item(self) -> TResponseInputItem | None:
@@ -616,12 +671,10 @@ class LocalCompactionSession(Session):
         Returns:
             The most recent item if it exists, None if the session is empty.
         """
-        self._invalidate_cache()
         return await self._session.pop_item()
 
     async def clear_session(self) -> None:
         """Clear all items from the underlying session."""
-        self._invalidate_cache()
         await self._session.clear_session()
 
     def __repr__(self) -> str:
