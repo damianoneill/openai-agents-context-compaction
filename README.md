@@ -78,13 +78,31 @@ result = await Runner.run(agent, "Hello!", session=session)
 - Compaction is **boundary-aware** – preserves function call pairs atomically
 - **`limit` parameter**: Also boundary-aware — not a simple tail slice; function call pairs are kept atomic even when using `limit`
 
+### Choosing `window_size`
+
+The `window_size` is measured in **items**, not tokens. Each conversation turn adds multiple items:
+
+| Scenario         | Items per turn                         | Guidance                                   |
+| ---------------- | -------------------------------------- | ------------------------------------------ |
+| Simple Q&A       | 2 (user + assistant)                   | `window_size=20` keeps ~10 exchanges       |
+| Single tool call | 4 (user + fc + fco + assistant)        | `window_size=20` keeps ~5 tool-using turns |
+| Batch tool calls | 2n+2 (user + n×fc + n×fco + assistant) | 3 parallel tools = 8 items/turn            |
+
+**Practical recommendations:**
+
+- **Light tool usage**: `window_size=30–50` (keeps 8–15 recent exchanges)
+- **Heavy tool usage**: `window_size=50–100` (accounts for 3–10 items per tool response)
+- **Token-sensitive workloads**: Start with `window_size=30`, monitor token logs, adjust up if context feels stale
+
+**Example:** If your agent typically calls 2 tools per turn, each turn produces ~6 items (user msg, 2 function_calls, 2 function_call_outputs, assistant msg). With `window_size=30`, you retain roughly 5 recent exchanges.
+
 ### Technical Note
 
 The OpenAI Agents SDK stores session data in [Responses API format](https://platform.openai.com/docs/api-reference/responses). Tool calls appear as separate `function_call` and `function_call_output` items matched by `call_id`. This package handles this transparently.
 
 ### Performance Considerations
 
-For very large sessions (thousands of items), compaction runs on every `get_items()` call. Results are cached and reused within the same agent turn (invalidated on writes), so repeated calls with the same parameters are O(1). The compaction algorithm itself is O(n) where n is the total session size. If performance becomes a concern:
+For very large sessions (thousands of items), compaction runs on every `get_items()` call. No in-process cache is kept — each call fetches from the underlying session to avoid stale reads when the session is backed by a shared store (e.g. Postgres) with concurrent writers. The compaction algorithm itself is O(n) where n is the total session size. If performance becomes a concern:
 
 - Consider periodic session pruning at the storage layer
 - Use a reasonable `window_size` that balances context retention with processing cost
@@ -93,13 +111,13 @@ For very large sessions (thousands of items), compaction runs on every `get_item
 
 ## Roadmap
 
-| Feature                       | Status         |
-| ----------------------------- | -------------- |
-| Sliding window compaction     | ✅ Implemented |
+| Feature                       | Status                                                            |
+| ----------------------------- | ----------------------------------------------------------------- |
+| Sliding window compaction     | ✅ Implemented                                                    |
 | Token-based limits            | 🔵 In progress (instrumentation done, budget enforcement planned) |
-| LLM-based summarization       | 🟡 Planned     |
-| Write-time compaction         | 🟡 Planned     |
-| Pluggable compaction policies | 🟡 Planned     |
+| LLM-based summarization       | 🟡 Planned                                                        |
+| Write-time compaction         | 🟡 Planned                                                        |
+| Pluggable compaction policies | 🟡 Planned                                                        |
 
 ---
 
