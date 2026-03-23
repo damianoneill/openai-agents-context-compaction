@@ -51,7 +51,7 @@ RUN pip install 'openai-agents-context-compaction[tiktoken]'
 RUN python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')"
 ```
 
-Token counts are currently logged for observability. Token-budget compaction (keeping as many recent items as fit within N tokens) is on the roadmap.
+Token counts are logged for observability. Token-budget compaction (keeping as many recent items as fit within N tokens) is also supported via the `token_budget` parameter — see [Token-budget compaction](#token-budget-compaction) below.
 
 ---
 
@@ -74,13 +74,50 @@ session = LocalCompactionSession(underlying, window_size=30)
 result = await Runner.run(agent, "Hello!", session=session)
 ```
 
-- `window_size` controls how many items to keep in the sliding window (`None`, the default, means no compaction)
 - Compaction is **boundary-aware** – preserves function call pairs atomically
 - **`limit` parameter**: Also boundary-aware — not a simple tail slice; function call pairs are kept atomic even when using `limit`
+- When both `window_size` and `token_budget` are set, compaction stops when **either** limit is reached
+
+### Token-budget compaction
+
+Use `token_budget` to limit context by token count rather than (or in addition to) item count:
+
+```python
+from openai_agents_context_compaction import LocalCompactionSession, TiktokenCounter
+
+# Token-budget only — keeps the most recent items that fit within 8000 tokens
+session = LocalCompactionSession(
+    underlying,
+    token_budget=8000,
+    token_counter=TiktokenCounter(),  # accurate OpenAI counts
+)
+
+# Both constraints — compaction stops when either is exhausted
+session = LocalCompactionSession(
+    underlying,
+    window_size=50,
+    token_budget=8000,
+    token_counter=TiktokenCounter(),
+)
+
+# Custom tokenizer (e.g. Anthropic)
+def my_counter(text: str) -> int:
+    return client.count_tokens(text, model="claude-sonnet-4-20250514")
+
+session = LocalCompactionSession(underlying, token_budget=8000, token_counter=my_counter)
+```
+
+**Illustrative `token_budget` starting points (tune for your workload):**
+
+- **Tight budget / small models**: `token_budget=4096`
+- **Moderate**: `token_budget=16384`
+- **Large models**: `token_budget=32768`
+
+The default `token_counter` uses ~4 chars/token (no dependencies). For accurate counts pass `TiktokenCounter()` (requires `pip install 'openai-agents-context-compaction[tiktoken]'`).
 
 ### Choosing `window_size`
 
-The `window_size` is measured in **items**, not tokens. Each conversation turn adds multiple items:
+`window_size` is measured in **items**, not tokens. Each conversation turn adds multiple items:
 
 | Scenario         | Items per turn                         | Guidance                                   |
 | ---------------- | -------------------------------------- | ------------------------------------------ |
@@ -92,7 +129,6 @@ The `window_size` is measured in **items**, not tokens. Each conversation turn a
 
 - **Light tool usage**: `window_size=30–50`
 - **Heavy tool usage**: `window_size=50–100`
-- **Token-sensitive workloads**: Start low, monitor token logs, increase if context feels stale
 
 **Example:** If your agent typically calls 2 tools per turn, each turn produces ~6 items. With `window_size=30`, you retain roughly 5 recent exchanges.
 
@@ -114,7 +150,7 @@ For very large sessions (thousands of items), compaction runs on every `get_item
 | Feature                       | Status                                                            |
 | ----------------------------- | ----------------------------------------------------------------- |
 | Sliding window compaction     | ✅ Implemented                                                    |
-| Token-based limits            | 🔵 In progress (instrumentation done, budget enforcement planned) |
+| Token-based limits            | ✅ Implemented (`token_budget` parameter)                         |
 | LLM-based summarization       | 🟡 Planned                                                        |
 | Write-time compaction         | 🟡 Planned                                                        |
 | Pluggable compaction policies | 🟡 Planned                                                        |

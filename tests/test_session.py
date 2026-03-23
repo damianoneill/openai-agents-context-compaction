@@ -8,7 +8,11 @@ import pytest
 from agents import Session, TResponseInputItem
 
 from openai_agents_context_compaction import LocalCompactionSession
-from openai_agents_context_compaction.session import _count_tokens, _extract_text
+from openai_agents_context_compaction.session import (
+    _count_tokens,
+    _determine_limiting_factor,
+    _extract_text,
+)
 
 # -------------------------------------------------------------------
 # Mock Session
@@ -63,6 +67,17 @@ def function_call_output(call_id: str, output: str = "result") -> TResponseInput
     return {"type": "function_call_output", "call_id": call_id, "output": output}
 
 
+def _validate_invariants(items: list[TResponseInputItem]) -> None:
+    """Validate Responses API invariants.
+
+    Every function_call must have a matching output and vice versa.
+    """
+    calls = {i["call_id"] for i in items if i.get("type") == "function_call"}
+    outputs = {i["call_id"] for i in items if i.get("type") == "function_call_output"}
+    assert calls <= outputs, f"Orphaned function_call(s): {calls - outputs}"
+    assert outputs <= calls, f"Orphaned function_call_output(s): {outputs - calls}"
+
+
 # -------------------------------------------------------------------
 # Base Test Class
 # -------------------------------------------------------------------
@@ -85,19 +100,10 @@ class TestLocalCompactionSession:
     def _validate_invariants(self, items: list[TResponseInputItem]) -> None:
         """Validate Responses API invariants that must NEVER be violated.
 
-        Checks:
-        - All function_calls have matching function_call_outputs (by call_id)
-        - All function_call_outputs have matching function_calls
-        - All role values are valid (user/assistant/system)
-
-        Why this matters:
-        - OpenAI Agents SDK rejects malformed conversation history
-        - Orphaned function call items cause runtime errors
+        Delegates pair-atomicity check to the module-level _validate_invariants,
+        then adds a role-value check specific to the sliding-window test suite.
         """
-        calls = {i["call_id"] for i in items if i.get("type") == "function_call"}
-        outputs = {i["call_id"] for i in items if i.get("type") == "function_call_output"}
-        assert calls <= outputs, f"Orphaned function_call(s): {calls - outputs}"
-        assert outputs <= calls, f"Orphaned function_call_output(s): {outputs - calls}"
+        _validate_invariants(items)
         for i in items:
             if i.get("role"):
                 assert i["role"] in ("user", "assistant", "system")
@@ -182,7 +188,7 @@ class TestLocalCompactionSession:
         - Both cases cause runtime errors in OpenAI Agents SDK
 
         This test verifies drop_orphaned_tool_outputs() catches these cases.
-        The function acts as a safety validator after boundary_aware_compact().
+        The function acts as a safety validator after _boundary_aware_compact().
         """
         mock = MockSession()
         await mock.add_items(
@@ -220,9 +226,11 @@ class TestLocalCompactionSession:
         await mock.add_items([msg1, fc, fco, msg2])
         compacting = LocalCompactionSession(mock, window_size=2)
         items = await compacting.get_items(limit=2)
-        # effective_size=min(2,2)=2, most recent is msg2 (size 1)
-        # Then function call pair (size 2) doesn't fit, dropped
-        # Then msg1 (size 1) fits, total = 2
+        # effective_size=min(2,2)=2. Backward walk:
+        #   msg2 (size 1): fits, budget 2→1
+        #   fco  (pair):   needs 2 slots, only 1 remaining → dropped
+        #   fc   (pair):   skipped (not in required_call_ids)
+        #   msg1 (size 1): fits, budget 1→0
         # Result: [msg1, msg2] in chronological order
         assert msg2 in items, "most recent message must be kept (strict recency)"
         assert msg1 in items, "older message fits in window"
@@ -279,10 +287,10 @@ class TestLocalCompactionSession:
     @pytest.mark.asyncio
     async def test_limit_alone_triggers_boundary_aware_compact(self) -> None:
         """window_size=None disables window compaction, but limit still triggers
-        boundary_aware_compact() to ensure function call pair atomicity.
+        _boundary_aware_compact() to ensure function call pair atomicity.
 
         Behavior:
-        - limit triggers boundary_aware_compact(items, limit)
+        - limit triggers _boundary_aware_compact(items, limit)
         - Chronological order preserved
         - Function call pair atomicity maintained even with limit alone
 
@@ -569,17 +577,30 @@ class TestCustomTokenCounter:
     async def test_token_counter_none_disables_counting(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Passing token_counter=None disables token counting in log output."""
+        """Passing token_counter=None disables token counting in log output.
+
+        Also verifies that the no-token-counter path still preserves function call
+        pair atomicity — _boundary_aware_compact_with_indices and drop_orphaned_tool_outputs
+        both run regardless of whether a token_counter is present.
+        """
         mock = MockSession()
-        await mock.add_items([user_msg(f"msg{i}") for i in range(5)])
-        compacting = LocalCompactionSession(mock, window_size=3, token_counter=None)
+        fc = function_call("c1")
+        fco = function_call_output("c1")
+        # 5 items total; window_size=4 keeps the pair plus one older message
+        await mock.add_items([user_msg("old"), user_msg("also_old"), fc, fco, user_msg("recent")])
+        compacting = LocalCompactionSession(mock, window_size=4, token_counter=None)
 
         with caplog.at_level(logging.INFO, logger="openai_agents_context_compaction.session"):
-            await compacting.get_items()
+            items = await compacting.get_items()
 
         # Should still log compaction but without token counts
         assert any("Compacted" in r.message for r in caplog.records)
         assert not any("tokens:" in r.message for r in caplog.records)
+
+        # Pair atomicity must hold even without a token_counter
+        _validate_invariants(items)
+        assert fc in items
+        assert fco in items
 
     @pytest.mark.asyncio
     async def test_get_items_returns_independent_copy(self) -> None:
@@ -597,3 +618,562 @@ class TestCustomTokenCounter:
 
         result2 = await compacting.get_items()
         assert len(result2) == 2, "Mutating a returned list must not affect subsequent calls"
+
+
+# -------------------------------------------------------------------
+# Token budget compaction tests
+# -------------------------------------------------------------------
+
+
+def _char_counter(text: str) -> int:
+    """Deterministic token counter: 1 token per character (no tiktoken dependency)."""
+    return len(text)
+
+
+def _token_cost(text: str) -> int:
+    """Mirror the +4 overhead applied inside _count_tokens / get_items."""
+    return len(text) + 4
+
+
+class TestTokenBudgetCompaction:
+    """Tests for the token_budget parameter on LocalCompactionSession."""
+
+    # ------------------------------------------------------------------
+    # A — Basic enforcement
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_token_budget_keeps_recent_items(self) -> None:
+        """Token budget retains the most recent items that fit."""
+        mock = MockSession()
+        # Each user_msg("msgN") has content "msgN" → 4 chars → cost = 4+4 = 8 tokens
+        await mock.add_items([user_msg(f"msg{i}") for i in range(5)])
+        # Budget for exactly 2 items: 2 * 8 = 16
+        compacting = LocalCompactionSession(mock, token_budget=16, token_counter=_char_counter)
+
+        items = await compacting.get_items()
+
+        assert len(items) == 2
+        assert items[0] == user_msg("msg3")
+        assert items[1] == user_msg("msg4")
+
+    @pytest.mark.asyncio
+    async def test_token_budget_none_disables_compaction(self) -> None:
+        """token_budget=None leaves all items untouched."""
+        mock = MockSession()
+        await mock.add_items([user_msg(f"msg{i}") for i in range(5)])
+        compacting = LocalCompactionSession(mock, token_budget=None, token_counter=_char_counter)
+
+        items = await compacting.get_items()
+
+        assert len(items) == 5
+
+    @pytest.mark.asyncio
+    async def test_all_items_fit_no_compaction(self) -> None:
+        """When total tokens <= token_budget, all items are returned unchanged."""
+        mock = MockSession()
+        await mock.add_items([user_msg("hi"), user_msg("ok")])
+        compacting = LocalCompactionSession(mock, token_budget=10000, token_counter=_char_counter)
+
+        items = await compacting.get_items()
+
+        assert len(items) == 2
+
+    # ------------------------------------------------------------------
+    # B — Function call pair atomicity
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_pair_kept_atomically_when_budget_covers_both(self) -> None:
+        """A function call pair is kept when the budget covers both items."""
+        mock = MockSession()
+        fc = function_call("x", "my_tool", arguments='{"a":1}')
+        fco = function_call_output("x", "result")
+        await mock.add_items([user_msg("older older older"), fc, fco])
+        # Budget: cost(fc) + cost(fco) but not older message
+        budget = sum(_token_cost(_extract_text(i)) for i in [fc, fco])
+        compacting = LocalCompactionSession(mock, token_budget=budget, token_counter=_char_counter)
+
+        items = await compacting.get_items()
+
+        _validate_invariants(items)
+        assert fc in items
+        assert fco in items
+
+    @pytest.mark.asyncio
+    async def test_pair_dropped_atomically_when_budget_too_small(self) -> None:
+        """A pair is dropped entirely when the budget cannot cover both items."""
+        mock = MockSession()
+        fc = function_call("y", "tool", arguments="{}")
+        fco = function_call_output("y", "out")
+        recent = user_msg("recent")
+        await mock.add_items([fc, fco, recent])
+        # Budget: enough for recent only (pair cost > budget)
+        recent_cost = len("recent") + 4
+        compacting = LocalCompactionSession(
+            mock, token_budget=recent_cost, token_counter=_char_counter
+        )
+
+        items = await compacting.get_items()
+
+        _validate_invariants(items)
+        assert fc not in items
+        assert fco not in items
+        assert recent in items
+
+    @pytest.mark.asyncio
+    async def test_soft_limit_keeps_first_pair_below_budget(self) -> None:
+        """First pair is kept even when its cost exceeds the token budget (soft limit)."""
+        mock = MockSession()
+        fc = function_call("z", "big_tool", arguments='{"key": "value"}')
+        fco = function_call_output("z", "big result output")
+        await mock.add_items([fc, fco])
+        # Budget of 1 is impossibly small — soft limit must fire
+        compacting = LocalCompactionSession(mock, token_budget=1, token_counter=_char_counter)
+
+        items = await compacting.get_items()
+
+        _validate_invariants(items)
+        assert fc in items
+        assert fco in items
+
+    @pytest.mark.asyncio
+    async def test_soft_limit_keeps_oversized_standalone_message(self) -> None:
+        """A single oversized message is kept even when it exceeds the token budget.
+
+        Without soft-limit on standalone messages, token_budget=1 with a 500-token
+        recent message would return [] — worse than no compaction at all.
+        """
+        mock = MockSession()
+        big_msg = user_msg("x" * 200)  # cost = 200 + 4 = 204 tokens
+        await mock.add_items([big_msg])
+        compacting = LocalCompactionSession(mock, token_budget=1, token_counter=_char_counter)
+
+        items = await compacting.get_items()
+
+        assert items == [big_msg]
+
+    @pytest.mark.asyncio
+    async def test_soft_limit_includes_only_first_oversized_item(self) -> None:
+        """After soft-limit inclusion, no further items are added."""
+        mock = MockSession()
+        old = user_msg("old message")
+        recent = user_msg("x" * 200)  # oversized
+        await mock.add_items([old, recent])
+        compacting = LocalCompactionSession(mock, token_budget=1, token_counter=_char_counter)
+
+        items = await compacting.get_items()
+
+        assert recent in items
+        assert old not in items
+
+    @pytest.mark.asyncio
+    async def test_pair_fits_exactly_at_budget(self) -> None:
+        """A pair whose cost exactly equals the budget is kept; older items are excluded."""
+        mock = MockSession()
+        fc = function_call("e", "tool", arguments="{}")
+        fco = function_call_output("e", "res")
+        old = user_msg("older")
+        await mock.add_items([old, fc, fco])
+        budget = sum(_token_cost(_extract_text(i)) for i in [fc, fco])
+        compacting = LocalCompactionSession(mock, token_budget=budget, token_counter=_char_counter)
+
+        items = await compacting.get_items()
+
+        _validate_invariants(items)
+        assert fc in items
+        assert fco in items
+        assert old not in items
+
+    @pytest.mark.asyncio
+    async def test_standalone_fits_exactly_at_budget(self) -> None:
+        """A standalone message whose cost exactly equals token_budget is included."""
+        mock = MockSession()
+        msg = user_msg("hello")
+        old = user_msg("this is an older and longer message")
+        await mock.add_items([old, msg])
+        budget = _token_cost(_extract_text(msg))
+        compacting = LocalCompactionSession(mock, token_budget=budget, token_counter=_char_counter)
+
+        items = await compacting.get_items()
+
+        assert msg in items
+        assert old not in items
+
+    @pytest.mark.asyncio
+    async def test_standalone_fits_but_older_pair_does_not(self) -> None:
+        """Standalone message is kept when the older pair cannot fit in the budget."""
+        mock = MockSession()
+        fc = function_call("f", "big_tool", arguments='{"key": "value"}')
+        fco = function_call_output("f", "big result")
+        recent = user_msg("hi")
+        await mock.add_items([fc, fco, recent])
+        # Budget only covers the standalone message
+        budget = _token_cost(_extract_text(recent))
+        compacting = LocalCompactionSession(mock, token_budget=budget, token_counter=_char_counter)
+
+        items = await compacting.get_items()
+
+        _validate_invariants(items)
+        assert recent in items
+        assert fc not in items
+        assert fco not in items
+
+    @pytest.mark.asyncio
+    async def test_older_pair_dropped_when_only_recent_pair_fits(self) -> None:
+        """When only the most recent pair fits, the older pair is dropped entirely."""
+        mock = MockSession()
+        fc1 = function_call("a", "tool1", arguments="{}")
+        fco1 = function_call_output("a", "result1")
+        fc2 = function_call("b", "tool2", arguments="{}")
+        fco2 = function_call_output("b", "result2")
+        await mock.add_items([fc1, fco1, fc2, fco2])
+        # Budget: cost of pair 2 only
+        budget = sum(_token_cost(_extract_text(i)) for i in [fc2, fco2])
+        compacting = LocalCompactionSession(mock, token_budget=budget, token_counter=_char_counter)
+
+        items = await compacting.get_items()
+
+        _validate_invariants(items)
+        assert fc1 not in items
+        assert fco1 not in items
+        assert fc2 in items
+        assert fco2 in items
+
+    # ------------------------------------------------------------------
+    # C — Dual constraint (window_size + token_budget)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_item_count_wins_over_large_token_budget(self) -> None:
+        """window_size is the binding constraint when token_budget is large."""
+        mock = MockSession()
+        await mock.add_items([user_msg(f"msg{i}") for i in range(10)])
+        compacting = LocalCompactionSession(
+            mock, window_size=2, token_budget=1_000_000, token_counter=_char_counter
+        )
+
+        items = await compacting.get_items()
+
+        assert len(items) == 2
+
+    @pytest.mark.asyncio
+    async def test_token_budget_wins_over_large_window_size(self) -> None:
+        """token_budget is the binding constraint when window_size is large."""
+        mock = MockSession()
+        # Each msg costs len("msgN") + 4 = 8 tokens
+        await mock.add_items([user_msg(f"msg{i}") for i in range(10)])
+        compacting = LocalCompactionSession(
+            mock, window_size=100, token_budget=8, token_counter=_char_counter
+        )
+
+        items = await compacting.get_items()
+
+        assert len(items) == 1
+
+    @pytest.mark.asyncio
+    async def test_dual_constraint_log_contains_both_values(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Compaction log includes both window and token_budget values when token is binding.
+
+        5 items; window_size=3 would keep 3 (24 tokens), but token_budget=16 (= 2 * 8)
+        is the tighter constraint and reduces the result to 2 items. The log must
+        include both constraint values for observability regardless of which won.
+        """
+        mock = MockSession()
+        # Each user_msg("msgN") costs len("msgN") + 4 = 8 tokens with _char_counter
+        await mock.add_items([user_msg(f"msg{i}") for i in range(5)])
+        compacting = LocalCompactionSession(
+            mock, window_size=3, token_budget=16, token_counter=_char_counter
+        )
+
+        with caplog.at_level(logging.INFO, logger="openai_agents_context_compaction.session"):
+            items = await compacting.get_items()
+
+        assert len(items) == 2, "token_budget=16 is the binding constraint (2 × 8 tokens)"
+        log_msgs = " ".join(r.message for r in caplog.records)
+        assert "window=3" in log_msgs
+        assert "token_budget=16" in log_msgs
+
+    @pytest.mark.asyncio
+    async def test_limit_and_token_budget_intersect(self) -> None:
+        """limit passed to get_items() acts as item-count constraint alongside token_budget.
+
+        With window_size=None, effective_size = limit. Both limit (item count) and
+        token_budget (token count) apply; the tighter constraint wins.
+        """
+        mock = MockSession()
+        # Each msg costs 8 tokens; limit=3 keeps 3, token_budget=8 keeps 1 — budget wins
+        await mock.add_items([user_msg(f"msg{i}") for i in range(5)])
+        compacting = LocalCompactionSession(mock, token_budget=8, token_counter=_char_counter)
+
+        items = await compacting.get_items(limit=3)
+
+        assert len(items) == 1
+        assert items[0] == user_msg("msg4")
+
+    @pytest.mark.asyncio
+    async def test_interleaved_message_between_pair_dropped_by_token_budget(self) -> None:
+        """A message interleaved between fc and fco is independently token-budget-accounted.
+
+        mid_msg sits between fc and fco in the list, but is NOT treated as part of the pair.
+        The pair's cost is computed as cost(fc) + cost(fco) only; mid_msg must compete for
+        budget on its own. Here the budget covers the pair and recent but not mid_msg, so
+        mid_msg is dropped while fc, fco, and recent are all retained.
+
+        This tests the subtle property that positional proximity to a pair does not grant
+        immunity from independent budget accounting.
+        """
+        mock = MockSession()
+        fc = function_call("t", "tool", arguments="{}")
+        fco = function_call_output("t", "res")
+        mid_msg = user_msg("interleaved")
+        recent = user_msg("hi")
+        await mock.add_items([fc, mid_msg, fco, recent])
+        # Budget covers pair + recent but not mid_msg
+        budget = sum(_token_cost(_extract_text(i)) for i in [fc, fco, recent])
+        compacting = LocalCompactionSession(mock, token_budget=budget, token_counter=_char_counter)
+
+        items = await compacting.get_items()
+
+        _validate_invariants(items)
+        assert fc in items
+        assert fco in items
+        assert recent in items
+        assert mid_msg not in items
+
+    # ------------------------------------------------------------------
+    # D — Validation / error cases
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_window_size_zero_with_token_budget_returns_empty(self) -> None:
+        """window_size=0 short-circuits to [] even when token_budget has capacity.
+
+        window_size <= 0 is the hard exit: one constraint says "nothing", result is empty.
+        """
+        mock = MockSession()
+        await mock.add_items([user_msg(f"msg{i}") for i in range(5)])
+        compacting = LocalCompactionSession(
+            mock, window_size=0, token_budget=1_000_000, token_counter=_char_counter
+        )
+
+        items = await compacting.get_items()
+
+        assert items == []
+
+    def test_token_budget_zero_raises(self) -> None:
+        """token_budget=0 raises ValueError at construction."""
+        mock = MockSession()
+        with pytest.raises(ValueError, match="token_budget"):
+            LocalCompactionSession(mock, token_budget=0)
+
+    def test_token_budget_negative_raises(self) -> None:
+        """token_budget < 0 raises ValueError at construction."""
+        mock = MockSession()
+        with pytest.raises(ValueError, match="token_budget"):
+            LocalCompactionSession(mock, token_budget=-1)
+
+    def test_token_budget_without_token_counter_raises(self) -> None:
+        """token_budget with token_counter=None raises ValueError at construction."""
+        mock = MockSession()
+        with pytest.raises(ValueError, match="token_counter"):
+            LocalCompactionSession(mock, token_budget=8000, token_counter=None)
+
+    @pytest.mark.asyncio
+    async def test_zero_returning_token_counter_clamped_to_one(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A token_counter that returns 0 is clamped to 1 with a WARNING.
+
+        After clamping each item costs 1+4=5 tokens. With token_budget=5, exactly
+        one item fits — confirming no infinite inclusion and correct budget arithmetic.
+        """
+
+        def zero_counter(text: str) -> int:
+            return 0
+
+        mock = MockSession()
+        await mock.add_items([user_msg(f"msg{i}") for i in range(5)])
+        # Clamped cost per item = 1 + 4 = 5; budget = 5 keeps exactly the most recent item
+        compacting = LocalCompactionSession(mock, token_budget=5, token_counter=zero_counter)
+
+        with caplog.at_level(logging.WARNING, logger="openai_agents_context_compaction.session"):
+            items = await compacting.get_items()
+
+        assert any("clamping to 1" in r.message for r in caplog.records)
+        assert len(items) == 1
+        assert items[0] == user_msg("msg4")
+
+    @pytest.mark.asyncio
+    async def test_token_budget_only_triggers_compaction_and_log(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """token_budget alone (no window_size) triggers compaction and INFO log."""
+        mock = MockSession()
+        await mock.add_items([user_msg(f"msg{i}") for i in range(5)])
+        compacting = LocalCompactionSession(mock, token_budget=16, token_counter=_char_counter)
+
+        with caplog.at_level(logging.INFO, logger="openai_agents_context_compaction.session"):
+            items = await compacting.get_items()
+
+        assert len(items) < 5
+        assert any("Compacted" in r.message for r in caplog.records)
+
+    # ------------------------------------------------------------------
+    # E — Invariants and ordering
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_order_preserved_after_token_budget_compaction(self) -> None:
+        """Chronological order is preserved after token-budget compaction."""
+        mock = MockSession()
+        fc = function_call("p", "tool", arguments="{}")
+        fco = function_call_output("p", "res")
+        msg = user_msg("recent")
+        await mock.add_items([user_msg("old1"), user_msg("old2"), fc, fco, msg])
+        # Budget for pair + recent msg — use _extract_text to get exact costs
+        budget = sum(_token_cost(_extract_text(i)) for i in [fc, fco, msg])
+        compacting = LocalCompactionSession(mock, token_budget=budget, token_counter=_char_counter)
+
+        items = await compacting.get_items()
+
+        _validate_invariants(items)
+        # fc must appear before fco, fco before msg
+        assert items.index(fc) < items.index(fco) < items.index(msg)
+
+    @pytest.mark.asyncio
+    async def test_large_history_tight_budget_returns_only_recent(self) -> None:
+        """Tight budget on a large history returns only the most recent items."""
+        mock = MockSession()
+        # 100 messages — cost per msg = len("msg_NNN") + 4 = 11 tokens
+        await mock.add_items([user_msg(f"msg_{i:03d}") for i in range(100)])
+        # Budget for exactly 2 messages
+        budget = 2 * (len("msg_099") + 4)
+        compacting = LocalCompactionSession(mock, token_budget=budget, token_counter=_char_counter)
+
+        items = await compacting.get_items()
+
+        assert len(items) == 2
+        assert items[0] == user_msg("msg_098")
+        assert items[1] == user_msg("msg_099")
+
+    @pytest.mark.asyncio
+    async def test_orphaned_output_as_most_recent_item_warns(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An orphaned function_call_output as the most recent item logs a WARNING.
+
+        This indicates bad session data. Compaction cannot include an orphan (it would
+        be removed by drop_orphaned_tool_outputs anyway), so the result may be empty.
+        Operators need visibility into this via a WARNING rather than a silent DEBUG log.
+        """
+        mock = MockSession()
+        orphan_output = function_call_output("no_matching_call", "result")
+        await mock.add_items([user_msg("older"), orphan_output])
+        compacting = LocalCompactionSession(mock, window_size=1, token_counter=_char_counter)
+
+        with caplog.at_level(logging.WARNING, logger="openai_agents_context_compaction.session"):
+            items = await compacting.get_items()
+
+        assert any("most recent item is an orphaned" in r.message.lower() for r in caplog.records)
+        # The orphan is not in the result (drop_orphaned_tool_outputs removes it)
+        assert orphan_output not in items
+
+    # ------------------------------------------------------------------
+    # F — Repr
+    # ------------------------------------------------------------------
+
+    def test_token_budget_in_repr(self) -> None:
+        """token_budget value appears in repr output."""
+        mock = MockSession(session_id="s1")
+        compacting = LocalCompactionSession(
+            mock, window_size=50, token_budget=8000, token_counter=_char_counter
+        )
+        r = repr(compacting)
+        assert "8000" in r
+        assert "50" in r
+
+
+# -------------------------------------------------------------------
+# Observability: limiting_factor, get_compaction_config
+# -------------------------------------------------------------------
+
+
+class TestDeterminingLimitingFactor:
+    """Unit tests for _determine_limiting_factor — pure function, no async needed."""
+
+    @pytest.mark.parametrize(
+        "items_before, items_after, item_budget, tokens_before, token_budget, soft_limit_fired, expected",  # noqa: E501
+        [
+            # tight window, fits in token budget → window_size
+            (10, 5, 5, 400, 100_000, False, "window_size"),
+            # fits in window, token budget exceeded → token_budget
+            (10, 2, 20, 80, 16, False, "token_budget"),
+            # both exceeded, items_after < item_budget → token was the tighter constraint
+            (10, 3, 5, 300, 100, False, "token_budget"),
+            # both exceeded, items_after == item_budget → window hit first (or simultaneously)
+            (10, 5, 5, 300, 100, False, "window_size"),
+            # no item budget — window never binding → token_budget
+            (10, 2, None, 80, 16, False, "token_budget"),
+            # soft_limit_fired=True overrides any constraint inference → soft_limit
+            # (constraints technically exceeded, but the signal from the walk wins)
+            (10, 1, 5, 300, 100, True, "soft_limit"),
+            # soft_limit_fired=True when nothing was exceeded (original observable case)
+            (1, 1, 10, 8, 100, True, "soft_limit"),
+        ],
+    )
+    def test_limiting_factor(
+        self,
+        items_before: int,
+        items_after: int,
+        item_budget: int | None,
+        tokens_before: int,
+        token_budget: int | None,
+        soft_limit_fired: bool,
+        expected: str,
+    ) -> None:
+        assert (
+            _determine_limiting_factor(
+                items_before,
+                items_after,
+                item_budget,
+                tokens_before,
+                token_budget,
+                soft_limit_fired=soft_limit_fired,
+            )
+            == expected
+        )
+
+
+class TestObservability:
+    """Tests for get_compaction_config."""
+
+    def test_get_compaction_config(self) -> None:
+        """get_compaction_config returns current configuration."""
+        mock = MockSession(session_id="cfg-test")
+        compacting = LocalCompactionSession(
+            mock, window_size=10, token_budget=5000, token_counter=_char_counter
+        )
+        config = compacting.get_compaction_config()
+        assert config == {
+            "session_id": "cfg-test",
+            "window_size": 10,
+            "token_budget": 5000,
+            "token_counter_type": "function",  # plain functions report type.__name__ == "function"
+        }
+
+    def test_get_compaction_config_defaults(self) -> None:
+        """get_compaction_config reflects None values and default counter name."""
+        mock = MockSession()
+        assert (
+            LocalCompactionSession(mock, token_counter=None).get_compaction_config()[
+                "token_counter_type"
+            ]
+            is None
+        )
+        assert (
+            LocalCompactionSession(mock).get_compaction_config()["token_counter_type"]
+            == "DefaultTokenCounter"
+        )
