@@ -1,7 +1,8 @@
 """Local compaction session wrapper.
 
 Provides a Session wrapper that delegates calls to an underlying session
-and optionally applies a sliding window compaction strategy.
+and optionally applies compaction by item count (window_size), token budget
+(token_budget), or both.
 
 COMPACTION PIPELINE:
 ====================
@@ -14,21 +15,24 @@ COMPACTION PIPELINE:
                                     │
                                     ▼
     ┌───────────────────────────────────────────────────────────────────────────┐
-    │  1. INDEX MAPPING (boundary_aware_compact)                                │
+    │  1. INDEX MAPPING (_boundary_aware_compact)                               │
     │     Build call_id → {call_index, output_index} map                        │
     │     Identify complete pairs (both call and output present)                │
     └───────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
     ┌───────────────────────────────────────────────────────────────────────────┐
-    │  2. BACKWARD WALK WITH BUDGET (boundary_aware_compact)                    │
+    │  2. BACKWARD WALK WITH DUAL BUDGET (_boundary_aware_compact)              │
     │     Walk backwards from most recent item                                  │
-    │     Track budget (remaining window capacity)                              │
-    │     - function_call_output (complete pair): reserve budget for BOTH       │
-    │       output and its matching call (budget -= 2), mark both indices       │
+    │     Track item budget (window_size) and token budget (token_budget)       │
+    │     Either budget exhausted → stop; the tighter constraint wins           │
+    │     - function_call_output (complete pair): include if item budget >= 2   │
+    │       AND token budget >= pair token cost; item budget -= 2,              │
+    │       token budget -= pair token cost; mark both indices                  │
     │     - function_call (already marked): skip (already budgeted)             │
     │     - function_call (orphan/pair not selected): skip                      │
-    │     - regular message / unknown type: include if budget > 0              │
+    │     - regular message / unknown type: include if item budget >= 1         │
+    │       AND token budget >= item token cost; decrement both budgets         │
     │     Items are marked at their ORIGINAL indices                            │
     └───────────────────────────────────────────────────────────────────────────┘
                                     │
@@ -50,6 +54,20 @@ COMPACTION PIPELINE:
     │  Result (chronological order — original ordering preserved)               │
     │  [asst_msg, func_call(b), output(b), user_msg]                            │
     └───────────────────────────────────────────────────────────────────────────┘
+
+Soft Limit:
+- If the most recent item exceeds both budgets and nothing has been included yet,
+  it is kept anyway to prevent an empty or invalid result.
+- For function call pairs: if the pair cost exceeds the budget but nothing has been
+  included yet, both items are kept regardless (pair atomicity is preserved).
+- After soft-limit inclusion both budgets are set to zero; no further items are added.
+
+Token Budget:
+- token_counter is called per item to estimate token cost (no built-in caching).
+- Each item's cost = token_counter(text) + 4 (the +4 covers per-item structural
+  overhead: role, separators, etc.).
+- If token_counter returns 0 or negative it is clamped to 1 with a WARNING.
+- Pass token_counter=None to disable token counting and token_budget enforcement.
 
 Order Preservation:
 - Unlike a pair-bundling approach that groups fc/fco together then reassembles,
@@ -99,7 +117,10 @@ class DefaultTokenCounter:
         return max(1, len(text) // 4)
 
 
-# Singleton instance for default parameter
+# Singleton used as the default parameter for token_counter. Safe because
+# DefaultTokenCounter is stateless — all LocalCompactionSession instances share
+# this object without interference. If you subclass DefaultTokenCounter and need
+# per-instance state, pass an explicit instance rather than relying on the default.
 _default_token_counter = DefaultTokenCounter()
 
 
@@ -134,12 +155,6 @@ class TiktokenCounter:
 
 # =============================================================================
 # Token counting helpers
-# =============================================================================
-#
-# FUTURE: These helpers lay the groundwork for token-based compaction.
-# Currently, token counts are only logged (observability / baseline data).
-# The next step is a compaction mode that enforces a token budget rather than
-# an item-count window — keeping as many recent items as fit within N tokens.
 # =============================================================================
 
 
@@ -185,6 +200,15 @@ def _extract_text(item: TResponseInputItem) -> str:
             item.get("type"),
             item.get("role"),
             item,
+        )
+
+    if not parts:
+        logger.debug(
+            "No text extractable from item (type=%r, role=%r, keys=%r); "
+            "token count will be clamped to 1",
+            item.get("type"),
+            item.get("role"),
+            list(item.keys()),
         )
 
     return " ".join(parts)
@@ -260,20 +284,77 @@ class _CallIndices(TypedDict):
 
 def _boundary_aware_compact_with_indices(
     items: list[TResponseInputItem],
-    window_size: int,
-) -> tuple[list[TResponseInputItem], list[int]]:
+    window_size: int | None,
+    item_tokens_by_index: list[int] | None = None,
+    token_budget: int | None = None,
+) -> tuple[list[TResponseInputItem], list[int], bool]:
     """Internal: compact history and return both items and their original indices.
 
-    Returns:
-        Tuple of (compacted_items, kept_indices) where kept_indices are the
-        original positions of the kept items.
-    """
-    if window_size <= 0:
-        return [], []
+    Args:
+        items: Full conversation history.
+        window_size: Max items to keep (None = no item-count constraint).
+        item_tokens_by_index: Pre-computed token cost per item (same indexing as items).
+            Each value must include the +4 per-item structural overhead (role, separators)
+            so costs are consistent with the budget accounting in the backward walk.
+            Required when token_budget is set; ignored otherwise.
+        token_budget: Max tokens to keep (None = no token constraint).
 
-    if len(items) <= window_size:
-        # All items fit — return as-is with all indices
-        return list(items), list(range(len(items)))
+    Returns:
+        Tuple of (compacted_items, kept_indices, soft_limit_fired) where
+        kept_indices are the original positions of the kept items and
+        soft_limit_fired is True when an item was kept despite exceeding the budget
+        (to avoid returning an empty result).
+
+    Raises:
+        ValueError: If token_budget is set but item_tokens_by_index is None.
+            Note: get_items() never triggers this — constructor validation ensures
+            token_budget requires token_counter, and item_tokens_by_index is always
+            computed when token_counter is present. This guard protects direct callers
+            of this private function.
+    """
+    if token_budget is not None and item_tokens_by_index is None:
+        raise ValueError(
+            "item_tokens_by_index is required when token_budget is set; "
+            "token budget would be silently ignored without it"
+        )
+
+    # window_size=0 or negative → empty result
+    if window_size is not None and window_size <= 0:
+        return [], [], False
+
+    # No constraints → return everything
+    if window_size is None and token_budget is None:
+        return list(items), list(range(len(items))), False
+
+    # Item-count only: short-circuit if all items already fit
+    if token_budget is None and window_size is not None and len(items) <= window_size:
+        return list(items), list(range(len(items))), False
+
+    # Pre-compute total token cost once for use in the short-circuit checks below.
+    # CONTRACT: item_tokens_by_index values must include the +4 per-item structural
+    # overhead (role, separators, etc.), matching the cost model used in the backward
+    # walk below. get_items() adds this overhead when building the list. A caller
+    # passing raw token counts (without overhead) will get a subtly wrong short-circuit.
+    total_tokens = sum(item_tokens_by_index) if item_tokens_by_index is not None else None
+
+    # Both constraints: short-circuit if all items fit within both
+    if (
+        window_size is not None
+        and token_budget is not None
+        and total_tokens is not None
+        and len(items) <= window_size
+        and total_tokens <= token_budget
+    ):
+        return list(items), list(range(len(items))), False
+
+    # Token-budget only: short-circuit if total tokens already fit.
+    if (
+        window_size is None
+        and token_budget is not None
+        and total_tokens is not None
+        and total_tokens <= token_budget
+    ):
+        return list(items), list(range(len(items))), False
 
     # Build call_id -> indices map
     call_to_indices: dict[str, _CallIndices] = {}
@@ -301,70 +382,199 @@ def _boundary_aware_compact_with_indices(
         if indices["call"] is not None and indices["output"] is not None:
             complete_pairs[call_id] = (indices["call"], indices["output"])
 
-    # Walk backwards, marking indices
+    # Walk backwards, marking indices to include
+    # Two independent budgets: item count and token count (either may be None = unlimited)
     included_indices: set[int] = set()
     required_call_ids: set[str] = set()
-    budget = window_size
+    item_budget: int | None = window_size
+    token_remaining: int | None = token_budget
+    soft_limit_fired: bool = False
 
     for idx in range(len(items) - 1, -1, -1):
+        # Early termination: either budget exhausted — nothing more can be included
+        # (intersection semantics: both constraints must be satisfied to include any item)
+        if (item_budget is not None and item_budget == 0) or (
+            token_remaining is not None and token_remaining == 0
+        ):
+            break
+
         current_item = items[idx]
 
         if _is_function_call_output(current_item):
             call_id = _get_call_id(current_item)
             if call_id and call_id in complete_pairs:
-                if budget >= 2:
+                call_idx = complete_pairs[call_id][0]
+                pair_token_cost: int | None = None
+                if item_tokens_by_index is not None:
+                    pair_token_cost = item_tokens_by_index[idx] + item_tokens_by_index[call_idx]
+
+                fits_items = item_budget is None or item_budget >= 2
+                fits_tokens = (
+                    token_remaining is None
+                    or pair_token_cost is None
+                    or token_remaining >= pair_token_cost
+                )
+
+                if fits_items and fits_tokens:
                     included_indices.add(idx)
-                    call_idx = complete_pairs[call_id][0]
                     included_indices.add(call_idx)
                     required_call_ids.add(call_id)
-                    budget -= 2
+                    if item_budget is not None:
+                        item_budget -= 2
+                    if token_remaining is not None and pair_token_cost is not None:
+                        token_remaining -= pair_token_cost
                 elif not included_indices:
+                    # Soft limit: nothing included yet — keep this pair regardless of budget
+                    # to avoid returning empty/stale data.
                     logger.debug(
-                        "Window size %d smaller than function call pair size 2, "
-                        "keeping pair anyway",
-                        window_size,
+                        "Budget too small for function call pair call_id=%s "
+                        "(item_budget=%s, token_remaining=%s, pair_cost=%s), "
+                        "keeping pair anyway (soft limit)",
+                        call_id,
+                        item_budget,
+                        token_remaining,
+                        pair_token_cost,
                     )
                     included_indices.add(idx)
-                    call_idx = complete_pairs[call_id][0]
                     included_indices.add(call_idx)
                     required_call_ids.add(call_id)
-                    budget = 0
+                    soft_limit_fired = True
+                    if item_budget is not None:
+                        item_budget = 0
+                    if token_remaining is not None:
+                        token_remaining = 0
                 else:
                     logger.debug(
-                        "Skipping function call pair call_id=%s: budget %d < 2",
+                        "Skipping function call pair call_id=%s: "
+                        "item_budget=%s, token_remaining=%s, pair_cost=%s",
                         call_id,
-                        budget,
+                        item_budget,
+                        token_remaining,
+                        pair_token_cost,
                     )
             else:
-                logger.debug("Dropping orphaned function_call_output with call_id=%s", call_id)
+                if not included_indices:
+                    # Most recent item is an orphan — compaction may return [].
+                    # This indicates bad session data; warn so operators can investigate.
+                    logger.warning(
+                        "Most recent item is an orphaned function_call_output "
+                        "(call_id=%s, no matching function_call). "
+                        "Compaction may return an empty result.",
+                        call_id,
+                    )
+                else:
+                    logger.debug("Dropping orphaned function_call_output with call_id=%s", call_id)
             continue
 
         if _is_function_call(current_item):
             call_id = _get_call_id(current_item)
             if call_id and call_id in required_call_ids:
                 continue
-            logger.debug("Dropping orphaned function_call with call_id=%s", call_id)
+            if call_id and call_id in complete_pairs:
+                # Part of a complete pair but the output hasn't been processed yet
+                # (fc appears after fco in the list — unusual but legal). The pair will
+                # be included when the fco is encountered; skip here without "orphaned" log.
+                logger.debug(
+                    "Skipping function_call call_id=%s (will be budgeted with its output)",
+                    call_id,
+                )
+            else:
+                # Truly orphaned — no matching output in the session.
+                # drop_orphaned_tool_outputs will also catch it as a defense-in-depth pass.
+                logger.debug("Dropping orphaned function_call with call_id=%s", call_id)
             continue
 
-        if _is_conversation_message(current_item):
-            if budget > 0:
-                included_indices.add(idx)
-                budget -= 1
-            continue
+        # Regular message or unknown type — single-slot item.
+        # NOTE: kept as a separate branch from the pair case above intentionally.
+        # Pairs require extra bookkeeping (call_idx, required_call_ids) that doesn't
+        # apply here; merging the two branches would add abstraction without simplifying.
+        item_token_cost: int | None = (
+            item_tokens_by_index[idx] if item_tokens_by_index is not None else None
+        )
+        fits_items = item_budget is None or item_budget >= 1
+        fits_tokens = (
+            token_remaining is None or item_token_cost is None or token_remaining >= item_token_cost
+        )
 
-        if budget > 0:
-            logger.warning(
-                "Unknown item type encountered: %r. Including as single item.",
-                current_item.get("type"),
-            )
+        is_unknown = not _is_conversation_message(current_item)
+
+        if fits_items and fits_tokens:
+            if is_unknown:
+                logger.warning(
+                    "Unknown item type encountered: %r. Including as single item.",
+                    current_item.get("type"),
+                )
             included_indices.add(idx)
-            budget -= 1
+            if item_budget is not None:
+                item_budget -= 1
+            if token_remaining is not None and item_token_cost is not None:
+                token_remaining -= item_token_cost
+        elif not included_indices:
+            # Soft limit: nothing included yet — keep this item regardless of budget
+            # (e.g. a single oversized message should not produce an empty result).
+            logger.debug(
+                "Budget too small for single item at idx=%d "
+                "(item_budget=%s, token_remaining=%s, item_cost=%s), "
+                "keeping anyway (soft limit)",
+                idx,
+                item_budget,
+                token_remaining,
+                item_token_cost,
+            )
+            if is_unknown:
+                logger.warning(
+                    "Unknown item type encountered: %r. Including as single item.",
+                    current_item.get("type"),
+                )
+            included_indices.add(idx)
+            soft_limit_fired = True
+            if item_budget is not None:
+                item_budget = 0
+            if token_remaining is not None:
+                token_remaining = 0
 
     sorted_indices = sorted(included_indices)
-    return [items[i] for i in sorted_indices], sorted_indices
+    return [items[i] for i in sorted_indices], sorted_indices, soft_limit_fired
 
 
-def boundary_aware_compact(
+def _determine_limiting_factor(
+    items_before: int,
+    items_after: int,
+    item_budget: int | None,
+    tokens_before: int,
+    token_budget: int | None,
+    soft_limit_fired: bool = False,
+) -> str:
+    """Return the constraint that caused compaction.
+
+    Returns one of: ``'window_size'``, ``'token_budget'``, ``'soft_limit'``.
+
+    When both constraints are technically exceeded, ``items_after`` is used to
+    determine which was actually tighter: if fewer items were kept than the
+    item_budget allows, the token budget stopped the walk before the window
+    was filled.
+
+    ``soft_limit_fired`` must be passed from the compaction result; inferring it
+    from items_before/items_after alone is unreliable when constraints are also active.
+    """
+    if soft_limit_fired:
+        return "soft_limit"
+    item_constrained = item_budget is not None and items_before > item_budget
+    token_constrained = token_budget is not None and tokens_before > token_budget
+    if item_constrained and token_constrained:
+        # item_budget is not None — guaranteed by item_constrained's definition
+        if items_after < item_budget:  # type: ignore[operator]
+            return "token_budget"
+        return "window_size"
+    if item_constrained:
+        return "window_size"
+
+    if token_constrained:
+        return "token_budget"
+    return "soft_limit"
+
+
+def _boundary_aware_compact(
     items: list[TResponseInputItem],
     window_size: int,
 ) -> list[TResponseInputItem]:
@@ -403,7 +613,7 @@ def boundary_aware_compact(
     Returns:
         Compacted list of items with function call pairs preserved, in original order.
     """
-    compacted_items, _ = _boundary_aware_compact_with_indices(items, window_size)
+    compacted_items, _, _ = _boundary_aware_compact_with_indices(items, window_size)
     return drop_orphaned_tool_outputs(compacted_items)
 
 
@@ -484,39 +694,52 @@ class LocalCompactionSession(Session):
         The underlying session may be backed by a shared database
         with multiple application servers writing concurrently. An in-process
         cache would go stale when another server modifies the session.
+        For single-process deployments calling ``get_items`` frequently on large
+        histories, a TTL or invalidation-hook cache could reduce the O(n)
+        compaction overhead; this is left as a future extension.
 
     Args:
         session: The underlying session to wrap.
-        window_size: Max items to keep when retrieving. None disables compaction.
+        window_size: Max items to keep when retrieving. None disables item-count compaction.
             **Soft limit**: may be exceeded by 1 item to preserve atomic function
             call pairs (a pair requires 2 slots; if window_size=1 and the most
             recent item is a function_call_output, both call and output are kept).
-        token_counter: A callable ``(str) -> int`` used to estimate token counts
-            for observability logging. Defaults to a ~4 chars/token estimate
-            (model-agnostic). Pass ``None`` to disable token counting entirely.
+        token_counter: A callable ``(str) -> int`` used to estimate token counts.
+            Defaults to a ~4 chars/token estimate (model-agnostic).
+            Pass ``None`` to disable token counting (also disables ``token_budget``).
             For accurate OpenAI counts, use ``TiktokenCounter()``.
             For other models (e.g. Anthropic Claude), supply a tokenizer via the provider SDK.
+        token_budget: Max tokens to keep when retrieving. None disables token-budget
+            compaction. When set alongside ``window_size``, both constraints apply and
+            compaction stops when **either** is exhausted. Requires ``token_counter``
+            to be set (raises ``ValueError`` if ``token_counter=None``).
 
     Example:
         >>> from agents import SQLiteSession
         >>> underlying = SQLiteSession(session_id="my-session")
-        >>> compacting_session = LocalCompactionSession(underlying, window_size=100)
-        >>> # get_items() returns at most 100 most recent items
-        >>> # For accurate OpenAI token counts:
+        >>> # Item-count compaction only:
+        >>> session = LocalCompactionSession(underlying, window_size=50)
+        >>> # Token-budget compaction only (accurate OpenAI counts):
         >>> from openai_agents_context_compaction import TiktokenCounter
-        >>> session_oai = LocalCompactionSession(
-        ...     underlying, window_size=100, token_counter=TiktokenCounter(),
-        ... )
-        >>> # For non-OpenAI models, define a token counter function:
-        >>> def my_token_counter(text: str) -> int:
-        ...     return client.count_tokens(text, model="claude-sonnet-4-20250514")
         >>> session = LocalCompactionSession(
-        ...     underlying, window_size=100, token_counter=my_token_counter,
+        ...     underlying, token_budget=8000, token_counter=TiktokenCounter(),
         ... )
-        >>> # To disable token counting entirely:
-        >>> session_no_tokens = LocalCompactionSession(
-        ...     underlying, window_size=100, token_counter=None,
+        >>> # Both constraints — compaction stops when either is exhausted:
+        >>> session = LocalCompactionSession(
+        ...     underlying, window_size=50, token_budget=8000, token_counter=TiktokenCounter(),
         ... )
+        >>> # Custom tokenizer (e.g. Anthropic) — adapt to your SDK version:
+        >>> def my_counter(text: str) -> int:
+        ...     response = client.beta.messages.count_tokens(
+        ...         model="claude-haiku-4-5-20251001",  # any valid model works
+        ...         messages=[{"role": "user", "content": text}],
+        ...     )
+        ...     return response.input_tokens
+        >>> session = LocalCompactionSession(
+        ...     underlying, token_budget=8000, token_counter=my_counter
+        ... )
+        >>> # Disable token counting entirely:
+        >>> session = LocalCompactionSession(underlying, window_size=50, token_counter=None)
     """
 
     def __init__(
@@ -524,37 +747,55 @@ class LocalCompactionSession(Session):
         session: Session,
         window_size: int | None = None,
         token_counter: Callable[[str], int] | None = _default_token_counter,
+        token_budget: int | None = None,
     ) -> None:
         """Initialize the LocalCompactionSession.
 
         Args:
             session: The underlying session to delegate calls to.
-            window_size: Maximum number of items to keep in the sliding window.
-                         If None, no compaction is applied.
-            token_counter: Callable that maps text to token count for logging.
-                          Defaults to ~4 chars/token. Pass None to disable.
+            window_size: Maximum number of items to keep. None disables item-count compaction.
+            token_counter: Callable that maps text to token count. Defaults to ~4 chars/token.
+                          Pass None to disable (also disables token_budget enforcement).
+            token_budget: Maximum tokens to keep. None disables token-budget compaction.
+                         Requires token_counter to be set.
+
+        Raises:
+            ValueError: If token_budget is set but token_counter is None.
+            ValueError: If token_budget is <= 0.
         """
+        if token_budget is not None and token_budget <= 0:
+            raise ValueError(f"token_budget must be a positive integer, got {token_budget!r}")
+        if token_budget is not None and token_counter is None:
+            raise ValueError(
+                "token_budget requires a token_counter; "
+                "pass token_counter=... or remove token_budget"
+            )
+
         self._session = session
         self._window_size = window_size
         self._token_counter = token_counter
+        self._token_budget = token_budget
 
         if token_counter is None:
-            logger.info("[session=%s] Token counting disabled", session.session_id)
+            logger.debug("[session=%s] Token counting disabled", session.session_id)
         else:
             encoding = getattr(token_counter, "encoding_name", None)
             counter_name = type(token_counter).__name__
+            budget_info = f" | token_budget={token_budget}" if token_budget is not None else ""
             if encoding:
-                logger.info(
-                    "[session=%s] Token counting: %s (%s)",
+                logger.debug(
+                    "[session=%s] Token counting: %s (%s)%s",
                     session.session_id,
                     counter_name,
                     encoding,
+                    budget_info,
                 )
             else:
-                logger.info(
-                    "[session=%s] Token counting: %s",
+                logger.debug(
+                    "[session=%s] Token counting: %s%s",
                     session.session_id,
                     counter_name,
+                    budget_info,
                 )
 
     @property
@@ -579,7 +820,7 @@ class LocalCompactionSession(Session):
                    (subject to window_size constraint).
                    Combined with window_size via effective_size = min(window, limit).
                    Note: even when window_size is None, passing a limit will trigger
-                   boundary_aware_compact() to ensure function call pair atomicity.
+                   _boundary_aware_compact() to ensure function call pair atomicity.
 
         Returns:
             List of input items representing the conversation history.
@@ -601,24 +842,49 @@ class LocalCompactionSession(Session):
         # history to correctly identify and preserve function call pairs.
         items = await self._session.get_items()
 
-        if effective_size is not None:
+        should_compact = effective_size is not None or self._token_budget is not None
+        if should_compact:
             original_count = len(items)
-            # Token counts are logged here to build observability baseline data.
-            # FUTURE: these will drive token-budget compaction (see Token counting helpers above).
-            # Compute tokens by position (index) — robust even if compaction copies items.
+            # Compute per-item token costs when either token logging or token_budget needs them.
+            # Keyed by original index — robust even if compaction copies/reorders items.
             item_tokens_by_index: list[int] | None = None
             original_tokens = 0
             if self._token_counter is not None:
                 item_tokens_by_index = []
                 for item in items:
                     text = _extract_text(item)
-                    tokens = self._token_counter(text) + 4
-                    item_tokens_by_index.append(tokens)
+                    raw = self._token_counter(text)
+                    if raw <= 0:
+                        # Counter returned an invalid value. Note: unrecognisable item
+                        # shapes (empty text from _extract_text) are logged at DEBUG in
+                        # _extract_text; this WARNING covers a misbehaving counter, not
+                        # an unknown item shape (DefaultTokenCounter clamps internally).
+                        logger.warning(
+                            "token_counter returned %d for text %r; clamping to 1",
+                            raw,
+                            text[:50],
+                        )
+                        raw = 1
+                    item_tokens_by_index.append(raw + 4)
                 original_tokens = sum(item_tokens_by_index)
 
             # Use internal function to get both items and their original indices
-            items, kept_indices = _boundary_aware_compact_with_indices(items, effective_size)
+            items, kept_indices, soft_limit_fired = _boundary_aware_compact_with_indices(
+                items,
+                window_size=effective_size,
+                item_tokens_by_index=item_tokens_by_index,
+                token_budget=self._token_budget,
+            )
             dropped = original_count - len(items)
+
+            limiting_factor = _determine_limiting_factor(
+                items_before=original_count,
+                items_after=len(items),
+                item_budget=effective_size,
+                tokens_before=original_tokens,
+                token_budget=self._token_budget,
+                soft_limit_fired=soft_limit_fired,
+            )
 
             if self._token_counter is not None and item_tokens_by_index is not None:
                 # Sum tokens for kept indices. Note: drop_orphaned_tool_outputs runs
@@ -631,32 +897,61 @@ class LocalCompactionSession(Session):
                     if original_tokens > 0
                     else 0.0
                 )
-                logger.info(
-                    "[session=%s] Compacted %d → %d items"
-                    " (dropped %d, window=%d) | tokens: %d → %d (%.1f%% reduction)",
-                    self.session_id,
-                    original_count,
-                    len(items),
-                    dropped,
-                    effective_size,
-                    original_tokens,
-                    compacted_tokens,
-                    token_reduction_pct,
-                )
+                if dropped > 0:
+                    logger.info(
+                        "[session=%s] Compacted %d → %d items"
+                        " (dropped %d, limiting_factor=%s, window=%s, token_budget=%s)"
+                        " | tokens: %d → %d (%.1f%% reduction)",
+                        self.session_id,
+                        original_count,
+                        len(items),
+                        dropped,
+                        limiting_factor,
+                        effective_size,
+                        self._token_budget,
+                        original_tokens,
+                        compacted_tokens,
+                        token_reduction_pct,
+                    )
+                else:
+                    logger.debug(
+                        "[session=%s] Compaction check: %d items, nothing dropped"
+                        " (window=%s, token_budget=%s) | tokens: %d",
+                        self.session_id,
+                        original_count,
+                        effective_size,
+                        self._token_budget,
+                        original_tokens,
+                    )
             else:
-                logger.info(
-                    "[session=%s] Compacted %d → %d items (dropped %d, window=%d)",
-                    self.session_id,
-                    original_count,
-                    len(items),
-                    dropped,
-                    effective_size,
-                )
+                if dropped > 0:
+                    logger.info(
+                        "[session=%s] Compacted %d → %d items"
+                        " (dropped %d, limiting_factor=%s, window=%s, token_budget=%s)",
+                        self.session_id,
+                        original_count,
+                        len(items),
+                        dropped,
+                        limiting_factor,
+                        effective_size,
+                        self._token_budget,
+                    )
+                else:
+                    logger.debug(
+                        "[session=%s] Compaction check: %d items, nothing dropped"
+                        " (window=%s, token_budget=%s)",
+                        self.session_id,
+                        original_count,
+                        effective_size,
+                        self._token_budget,
+                    )
 
         # NOTE: This call is intentional as a defense-in-depth safety validator.
-        # It ensures that any edge cases missed by boundary_aware_compact are caught.
+        # It ensures that any edge cases missed by _boundary_aware_compact are caught.
         # Runs even when no compaction happened (len(items) <= window_size) because
         # orphans could exist in the source data regardless of compaction.
+        # drop_orphaned_tool_outputs emits DEBUG logs for anything it removes,
+        # so drops are visible in logs regardless of whether compaction was active.
         return drop_orphaned_tool_outputs(items)
 
     async def add_items(self, items: list[TResponseInputItem]) -> None:
@@ -684,5 +979,21 @@ class LocalCompactionSession(Session):
         return (
             f"<LocalCompactionSession("
             f"session_id={self.session_id!r}, "
-            f"window_size={self._window_size})>"
+            f"window_size={self._window_size}, "
+            f"token_budget={self._token_budget})>"
         )
+
+    def get_compaction_config(self) -> dict[str, object]:
+        """Get current compaction configuration.
+
+        Returns:
+            Dict with keys: session_id, window_size, token_budget, token_counter_type.
+        """
+        return {
+            "session_id": self.session_id,
+            "window_size": self._window_size,
+            "token_budget": self._token_budget,
+            "token_counter_type": type(self._token_counter).__name__
+            if self._token_counter
+            else None,
+        }
