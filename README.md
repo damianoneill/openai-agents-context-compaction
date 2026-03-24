@@ -100,9 +100,13 @@ session = LocalCompactionSession(
     token_counter=TiktokenCounter(),
 )
 
-# Custom tokenizer (e.g. Anthropic)
+# Custom tokenizer (e.g. Anthropic) — adapt to your SDK version
 def my_counter(text: str) -> int:
-    return client.count_tokens(text, model="claude-sonnet-4-20250514")
+    response = client.beta.messages.count_tokens(
+        model="claude-haiku-4-5-20251001",  # any valid model works
+        messages=[{"role": "user", "content": text}],
+    )
+    return response.input_tokens
 
 session = LocalCompactionSession(underlying, token_budget=8000, token_counter=my_counter)
 ```
@@ -147,13 +151,13 @@ For very large sessions (thousands of items), compaction runs on every `get_item
 
 ## Roadmap
 
-| Feature                       | Status                                                            |
-| ----------------------------- | ----------------------------------------------------------------- |
-| Sliding window compaction     | ✅ Implemented                                                    |
-| Token-based limits            | ✅ Implemented (`token_budget` parameter)                         |
-| LLM-based summarization       | 🟡 Planned                                                        |
-| Write-time compaction         | 🟡 Planned                                                        |
-| Pluggable compaction policies | 🟡 Planned                                                        |
+| Feature                       | Status                                    |
+| ----------------------------- | ----------------------------------------- |
+| Sliding window compaction     | ✅ Implemented                            |
+| Token-based limits            | ✅ Implemented (`token_budget` parameter) |
+| LLM-based summarization       | 🟡 Planned                                |
+| Write-time compaction         | 🟡 Planned                                |
+| Pluggable compaction policies | 🟡 Planned                                |
 
 ---
 

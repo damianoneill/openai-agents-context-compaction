@@ -547,7 +547,7 @@ def _determine_limiting_factor(
 ) -> str:
     """Return the constraint that caused compaction.
 
-    Returns one of: ``'window_size'``, ``'token_budget'``, ``'both'``, ``'soft_limit'``.
+    Returns one of: ``'window_size'``, ``'token_budget'``, ``'soft_limit'``.
 
     When both constraints are technically exceeded, ``items_after`` is used to
     determine which was actually tighter: if fewer items were kept than the
@@ -562,19 +562,13 @@ def _determine_limiting_factor(
     item_constrained = item_budget is not None and items_before > item_budget
     token_constrained = token_budget is not None and tokens_before > token_budget
     if item_constrained and token_constrained:
-        # Determine which constraint was actually the binding one.
-        # If items_after < item_budget, the token budget stopped the walk before
-        # the window was filled — tokens were tighter.
-        # If items_after == item_budget, the window was filled first (or both hit
-        # simultaneously on the same item).
-        if item_budget is not None and items_after < item_budget:
+        # item_budget is not None — guaranteed by item_constrained's definition
+        if items_after < item_budget:  # type: ignore[operator]
             return "token_budget"
-        elif item_budget is not None and items_after == item_budget:
-            return "window_size"
-        else:
-            return "both"  # defensive — should not occur in practice
+        return "window_size"
     if item_constrained:
         return "window_size"
+
     if token_constrained:
         return "token_budget"
     return "soft_limit"
@@ -734,9 +728,13 @@ class LocalCompactionSession(Session):
         >>> session = LocalCompactionSession(
         ...     underlying, window_size=50, token_budget=8000, token_counter=TiktokenCounter(),
         ... )
-        >>> # Custom tokenizer (e.g. Anthropic):
+        >>> # Custom tokenizer (e.g. Anthropic) — adapt to your SDK version:
         >>> def my_counter(text: str) -> int:
-        ...     return client.count_tokens(text, model="claude-sonnet-4-20250514")
+        ...     response = client.beta.messages.count_tokens(
+        ...         model="claude-haiku-4-5-20251001",  # any valid model works
+        ...         messages=[{"role": "user", "content": text}],
+        ...     )
+        ...     return response.input_tokens
         >>> session = LocalCompactionSession(
         ...     underlying, token_budget=8000, token_counter=my_counter
         ... )
