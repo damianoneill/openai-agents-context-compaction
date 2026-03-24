@@ -1,6 +1,6 @@
 [project]
 name = "openai-agents-context-compaction"
-version = "0.2.1"
+version = "0.3.0"
 description = "Context compaction for the OpenAI Agents SDK Runner loop"
 readme = "README.md"
 license = { text = "MIT" }
@@ -75,7 +75,7 @@ select = ["E", "F", "I", "N", "W", "UP"]
 
 [tool.commitizen]
 name = "cz_conventional_commits"
-version = "0.2.1"
+version = "0.3.0"
 tag_format = "v$version"
 version_files = [
     "pyproject.toml:^version",
