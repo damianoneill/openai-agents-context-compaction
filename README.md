@@ -190,16 +190,35 @@ The following ideas are documented for future reference. Build them when there's
 | ------------------------------ | ------------------------------------------------------------ |
 | **Time-based window**          | Sessions span days and old context becomes stale             |
 | **Importance scoring**         | Tool outputs vary wildly in value                            |
-| **Pluggable policy interface** | Multiple policies need swapping                              |
+| **Additional policy types**    | The built-in sliding window needs strategy-specific peers    |
 | **Role-based prioritization**  | Certain messages must never be evicted                       |
 | **Hybrid window**              | Last N items + always keep M most recent function call pairs |
 
-A pluggable policy interface would look like:
+The library now exposes an async policy interface with `SlidingWindowPolicy`
+as the built-in default. Custom policies can implement the same contract:
 
 ```python
+class CompactionResult(TypedDict):
+    items: list[TResponseInputItem]
+    original_count: int
+    returned_count: int
+    limiting_factor: str | None
+    summary_generated: bool
+    metadata: dict[str, object]
+
+
 class CompactionPolicy(Protocol):
-    def compact(self, items: list[TResponseInputItem]) -> list[TResponseInputItem]:
+    async def compact(
+        self,
+        items: list[TResponseInputItem],
+        *,
+        session_id: str,
+        limit: int | None = None,
+    ) -> CompactionResult:
         """Return compacted items. Must preserve function call pair atomicity."""
+
+    def get_config(self) -> dict[str, object]:
+        """Return a serializable description of the policy configuration."""
         ...
 ```
 

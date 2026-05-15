@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import logging
+from typing import cast
 
 import pytest
 from agents import Session, TResponseInputItem
 
-from openai_agents_context_compaction import LocalCompactionSession
+from openai_agents_context_compaction import CompactionResult, LocalCompactionSession
 from openai_agents_context_compaction.session import (
     _count_tokens,
     _determine_limiting_factor,
@@ -40,31 +41,73 @@ class MockSession(Session):
         self._items.clear()
 
 
+class RecordingPolicy:
+    """Test policy used to verify LocalCompactionSession delegation."""
+
+    def __init__(self, returned_items: list[TResponseInputItem]) -> None:
+        self._returned_items = list(returned_items)
+        self.calls: list[tuple[str, int | None, list[TResponseInputItem]]] = []
+
+    async def compact(
+        self,
+        items: list[TResponseInputItem],
+        *,
+        session_id: str,
+        limit: int | None = None,
+    ) -> CompactionResult:
+        self.calls.append((session_id, limit, list(items)))
+        return {
+            "items": list(self._returned_items),
+            "original_count": len(items),
+            "returned_count": len(self._returned_items),
+            "limiting_factor": "recording_policy",
+            "summary_generated": False,
+            "metadata": {"policy_type": "recording"},
+        }
+
+    def get_config(self) -> dict[str, object]:
+        return {
+            "policy_type": "recording",
+            "window_size": None,
+            "token_budget": None,
+            "token_counter_type": None,
+        }
+
+
 # -------------------------------------------------------------------
 # Helpers
 # -------------------------------------------------------------------
 
 
 def user_msg(content: str) -> TResponseInputItem:
-    return {"role": "user", "content": content}
+    return cast(TResponseInputItem, {"role": "user", "content": content})
 
 
 def assistant_msg(content: str) -> TResponseInputItem:
-    return {
-        "role": "assistant",
-        "type": "message",
-        "content": [{"text": content, "type": "output_text"}],
-    }
+    return cast(
+        TResponseInputItem,
+        {
+            "role": "assistant",
+            "type": "message",
+            "content": [{"text": content, "type": "output_text"}],
+        },
+    )
 
 
 def function_call(
     call_id: str, name: str = "test_func", arguments: str = "{}"
 ) -> TResponseInputItem:
-    return {"type": "function_call", "call_id": call_id, "name": name, "arguments": arguments}
+    return cast(
+        TResponseInputItem,
+        {"type": "function_call", "call_id": call_id, "name": name, "arguments": arguments},
+    )
 
 
 def function_call_output(call_id: str, output: str = "result") -> TResponseInputItem:
-    return {"type": "function_call_output", "call_id": call_id, "output": output}
+    return cast(
+        TResponseInputItem,
+        {"type": "function_call_output", "call_id": call_id, "output": output},
+    )
 
 
 def _validate_invariants(items: list[TResponseInputItem]) -> None:
@@ -72,8 +115,10 @@ def _validate_invariants(items: list[TResponseInputItem]) -> None:
 
     Every function_call must have a matching output and vice versa.
     """
-    calls = {i["call_id"] for i in items if i.get("type") == "function_call"}
-    outputs = {i["call_id"] for i in items if i.get("type") == "function_call_output"}
+    calls = {cast(str, i.get("call_id")) for i in items if i.get("type") == "function_call"}
+    outputs = {
+        cast(str, i.get("call_id")) for i in items if i.get("type") == "function_call_output"
+    }
     assert calls <= outputs, f"Orphaned function_call(s): {calls - outputs}"
     assert outputs <= calls, f"Orphaned function_call_output(s): {outputs - calls}"
 
@@ -106,7 +151,7 @@ class TestLocalCompactionSession:
         _validate_invariants(items)
         for i in items:
             if i.get("role"):
-                assert i["role"] in ("user", "assistant", "system")
+                assert i.get("role") in ("user", "assistant", "system")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("window_size", [None, 0, 1, 2, 5])
@@ -203,7 +248,7 @@ class TestLocalCompactionSession:
         self._validate_invariants(items)
         # Only valid user message remains
         assert len(items) == 1
-        assert items[0]["content"] == "msg"
+        assert items[0].get("content") == "msg"
 
     @pytest.mark.asyncio
     async def test_limit_and_window_interaction(self) -> None:
@@ -300,7 +345,7 @@ class TestLocalCompactionSession:
         await mock.add_items([user_msg(f"msg{i}") for i in range(5)])
         compacting = LocalCompactionSession(mock, window_size=None)
         items = await compacting.get_items(limit=3)
-        assert [i["content"] for i in items] == ["msg2", "msg3", "msg4"]
+        assert [i.get("content") for i in items] == ["msg2", "msg3", "msg4"]
 
     @pytest.mark.asyncio
     async def test_delegation_methods(self) -> None:
@@ -347,7 +392,9 @@ class TestLocalCompactionSession:
         message doesn't mask a regression in the behavioural assertion here.
         """
         mock = MockSession()
-        unknown_item = {"type": "future_reasoning_item", "content": "thinking..."}
+        unknown_item = cast(
+            TResponseInputItem, {"type": "future_reasoning_item", "content": "thinking..."}
+        )
         valid_msg = user_msg("valid message")
         await mock.add_items([user_msg("older"), unknown_item, valid_msg])
         compacting = LocalCompactionSession(mock, window_size=2)
@@ -367,7 +414,9 @@ class TestLocalCompactionSession:
         operators see this in production without enabling debug logging.
         """
         mock = MockSession()
-        unknown_item = {"type": "future_reasoning_item", "content": "thinking..."}
+        unknown_item = cast(
+            TResponseInputItem, {"type": "future_reasoning_item", "content": "thinking..."}
+        )
         await mock.add_items([user_msg("older"), unknown_item, user_msg("valid message")])
         compacting = LocalCompactionSession(mock, window_size=2)
 
@@ -1159,6 +1208,7 @@ class TestObservability:
         config = compacting.get_compaction_config()
         assert config == {
             "session_id": "cfg-test",
+            "policy_type": "sliding_window",
             "window_size": 10,
             "token_budget": 5000,
             "token_counter_type": "function",  # plain functions report type.__name__ == "function"
@@ -1177,3 +1227,91 @@ class TestObservability:
             LocalCompactionSession(mock).get_compaction_config()["token_counter_type"]
             == "DefaultTokenCounter"
         )
+
+    def test_get_compaction_config_uses_explicit_policy(self) -> None:
+        """Explicit policy config is surfaced instead of the legacy sliding-window keys."""
+        mock = MockSession(session_id="policy-test")
+        policy = RecordingPolicy([])
+
+        config = LocalCompactionSession(mock, window_size=1, policy=policy).get_compaction_config()
+
+        assert config == {
+            "session_id": "policy-test",
+            "policy_type": "recording",
+            "window_size": None,
+            "token_budget": None,
+            "token_counter_type": None,
+        }
+
+
+class TestPolicyDelegation:
+    """Tests for the new explicit policy path on LocalCompactionSession."""
+
+    @pytest.mark.asyncio
+    async def test_explicit_policy_overrides_legacy_window_and_limit(self) -> None:
+        """When policy= is provided, the wrapper delegates selection to that policy."""
+        mock = MockSession(session_id="policy-session")
+        all_items = [user_msg("older"), user_msg("newer"), user_msg("newest")]
+        await mock.add_items(all_items)
+        policy = RecordingPolicy(all_items[:2])
+
+        compacting = LocalCompactionSession(mock, window_size=1, policy=policy)
+        items = await compacting.get_items(limit=1)
+
+        assert items == all_items[:2]
+        assert policy.calls == [("policy-session", 1, all_items)]
+
+    @pytest.mark.asyncio
+    async def test_policy_exception_propagates(self) -> None:
+        """When the active policy raises, the exception propagates to the caller."""
+
+        class FailingPolicy:
+            async def compact(
+                self,
+                items: list[TResponseInputItem],
+                *,
+                session_id: str,
+                limit: int | None = None,
+            ) -> CompactionResult:
+                raise RuntimeError("summariser unavailable")
+
+            def get_config(self) -> dict[str, object]:
+                return {"policy_type": "failing"}
+
+        mock = MockSession(session_id="fail-session")
+        await mock.add_items([user_msg("hi")])
+        compacting = LocalCompactionSession(mock, policy=FailingPolicy())
+
+        with pytest.raises(RuntimeError, match="summariser unavailable"):
+            await compacting.get_items()
+
+    def test_repr_without_window_or_budget_keys(self) -> None:
+        """Repr is safe when the policy config omits window_size/token_budget."""
+
+        class MinimalPolicy:
+            async def compact(
+                self,
+                items: list[TResponseInputItem],
+                *,
+                session_id: str,
+                limit: int | None = None,
+            ) -> CompactionResult:
+                return {
+                    "items": list(items),
+                    "original_count": len(items),
+                    "returned_count": len(items),
+                    "limiting_factor": None,
+                    "summary_generated": False,
+                    "metadata": {},
+                }
+
+            def get_config(self) -> dict[str, object]:
+                return {"policy_type": "minimal"}
+
+        mock = MockSession(session_id="repr-test")
+        compacting = LocalCompactionSession(mock, policy=MinimalPolicy())
+        r = repr(compacting)
+        assert "repr-test" in r
+        assert "minimal" in r
+        assert "window_size" not in r
+        assert "token_budget" not in r

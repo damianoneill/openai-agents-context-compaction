@@ -97,12 +97,53 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import TypedDict
+from typing import Protocol, TypedDict
 
 from agents import Session, TResponseInputItem
 
 # NOTE: Verbose DEBUG logging is intentional during alpha; callers control via logging config.
 logger = logging.getLogger(__name__)
+
+
+class CompactionResult(TypedDict):
+    """Structured result returned by compaction policies."""
+
+    items: list[TResponseInputItem]
+    original_count: int
+    returned_count: int
+    limiting_factor: str | None
+    summary_generated: bool
+    metadata: dict[str, object]
+
+
+class CompactionPolicy(Protocol):
+    """Async interface for read-time history compaction policies."""
+
+    async def compact(
+        self,
+        items: list[TResponseInputItem],
+        *,
+        session_id: str,
+        limit: int | None = None,
+    ) -> CompactionResult:
+        """Return a compacted history view for the provided items."""
+
+    def get_config(self) -> dict[str, object]:
+        """Return a serializable description of the policy configuration."""
+
+
+class HistorySummarizer(Protocol):
+    """Provider-agnostic interface for compressing older history into one item."""
+
+    async def summarize(
+        self,
+        items: list[TResponseInputItem],
+        *,
+        session_id: str,
+        target_tokens: int | None = None,
+        existing_summary: str | None = None,
+    ) -> TResponseInputItem:
+        """Return one synthetic history item summarizing the provided items."""
 
 
 class DefaultTokenCounter:
@@ -224,6 +265,9 @@ def _count_tokens(
     then a +4 overhead is added per item for message-structure tokens
     (role, separators, etc.).
 
+    Note: values <= 0 from ``token_counter`` are clamped to 1, matching the
+    behaviour of ``_build_item_token_costs``.
+
     Args:
         items: List of Responses API items to count tokens for.
         token_counter: A callable that maps text to a token count.
@@ -235,8 +279,66 @@ def _count_tokens(
     total = 0
     for item in items:
         text = _extract_text(item)
-        total += token_counter(text) + 4
+        raw = token_counter(text)
+        if raw <= 0:
+            raw = 1
+        total += raw + 4
     return total
+
+
+def _build_item_token_costs(
+    items: list[TResponseInputItem],
+    token_counter: Callable[[str], int] | None,
+) -> tuple[list[int] | None, int]:
+    """Build per-item token costs, including structural overhead."""
+    if token_counter is None:
+        return None, 0
+
+    item_tokens_by_index: list[int] = []
+    for item in items:
+        text = _extract_text(item)
+        raw = token_counter(text)
+        if raw <= 0:
+            logger.warning(
+                "token_counter returned %d for text %r; clamping to 1",
+                raw,
+                text[:50],
+            )
+            raw = 1
+        item_tokens_by_index.append(raw + 4)
+
+    return item_tokens_by_index, sum(item_tokens_by_index)
+
+
+def _log_sliding_window_policy_configuration(
+    session_id: str,
+    token_counter: Callable[[str], int] | None,
+    token_budget: int | None,
+) -> None:
+    """Emit the legacy constructor log line for the default sliding-window policy."""
+    if token_counter is None:
+        logger.debug("[session=%s] Token counting disabled", session_id)
+        return
+
+    encoding = getattr(token_counter, "encoding_name", None)
+    counter_name = type(token_counter).__name__
+    budget_info = f" | token_budget={token_budget}" if token_budget is not None else ""
+    if encoding:
+        logger.debug(
+            "[session=%s] Token counting: %s (%s)%s",
+            session_id,
+            counter_name,
+            encoding,
+            budget_info,
+        )
+        return
+
+    logger.debug(
+        "[session=%s] Token counting: %s%s",
+        session_id,
+        counter_name,
+        budget_info,
+    )
 
 
 # =============================================================================
@@ -683,11 +785,184 @@ def drop_orphaned_tool_outputs(
     return cleaned
 
 
+class SlidingWindowPolicy:
+    """Boundary-aware sliding-window compaction policy."""
+
+    def __init__(
+        self,
+        window_size: int | None = None,
+        token_counter: Callable[[str], int] | None = _default_token_counter,
+        token_budget: int | None = None,
+    ) -> None:
+        """Initialize the sliding-window policy.
+
+        Args:
+            window_size: Maximum number of items to keep. None disables item-count compaction.
+            token_counter: Callable that maps text to token count. Defaults to ~4 chars/token.
+                Pass None to disable token counting (also disables token_budget enforcement).
+            token_budget: Maximum tokens to keep. None disables token-budget compaction.
+                Requires token_counter to be set.
+
+        Raises:
+            ValueError: If token_budget is set but token_counter is None.
+            ValueError: If token_budget is <= 0.
+        """
+        if token_budget is not None and token_budget <= 0:
+            raise ValueError(f"token_budget must be a positive integer, got {token_budget!r}")
+        if token_budget is not None and token_counter is None:
+            raise ValueError(
+                "token_budget requires a token_counter; "
+                "pass token_counter=... or remove token_budget"
+            )
+
+        self._window_size = window_size
+        self._token_counter = token_counter
+        self._token_budget = token_budget
+
+    async def compact(
+        self,
+        items: list[TResponseInputItem],
+        *,
+        session_id: str,
+        limit: int | None = None,
+    ) -> CompactionResult:
+        """Apply boundary-aware sliding-window compaction to history items."""
+        effective_size: int | None
+        if self._window_size is not None and limit is not None:
+            effective_size = min(self._window_size, limit)
+        elif self._window_size is not None:
+            effective_size = self._window_size
+        elif limit is not None:
+            effective_size = limit
+        else:
+            effective_size = None
+
+        original_count = len(items)
+        original_tokens = 0
+        returned_tokens: int | None = None
+        limiting_factor: str | None = None
+        soft_limit_fired = False
+        kept_indices: list[int] = list(range(len(items)))
+        compacted_items = list(items)
+
+        should_compact = effective_size is not None or self._token_budget is not None
+        if should_compact:
+            item_tokens_by_index, original_tokens = _build_item_token_costs(
+                compacted_items,
+                self._token_counter,
+            )
+
+            compacted_items, kept_indices, soft_limit_fired = _boundary_aware_compact_with_indices(
+                compacted_items,
+                window_size=effective_size,
+                item_tokens_by_index=item_tokens_by_index,
+                token_budget=self._token_budget,
+            )
+            dropped = original_count - len(compacted_items)
+            if dropped > 0 or soft_limit_fired:
+                limiting_factor = _determine_limiting_factor(
+                    items_before=original_count,
+                    items_after=len(compacted_items),
+                    item_budget=effective_size,
+                    tokens_before=original_tokens,
+                    token_budget=self._token_budget,
+                    soft_limit_fired=soft_limit_fired,
+                )
+
+            if self._token_counter is not None and item_tokens_by_index is not None:
+                compacted_tokens = sum(item_tokens_by_index[index] for index in kept_indices)
+                token_reduction_pct = (
+                    (original_tokens - compacted_tokens) / original_tokens * 100
+                    if original_tokens > 0
+                    else 0.0
+                )
+                returned_tokens = compacted_tokens
+                if dropped > 0:
+                    logger.info(
+                        "[session=%s] Compacted %d → %d items"
+                        " (dropped %d, limiting_factor=%s, window=%s, token_budget=%s)"
+                        " | tokens: %d → %d (%.1f%% reduction)",
+                        session_id,
+                        original_count,
+                        len(compacted_items),
+                        dropped,
+                        limiting_factor,
+                        effective_size,
+                        self._token_budget,
+                        original_tokens,
+                        compacted_tokens,
+                        token_reduction_pct,
+                    )
+                else:
+                    logger.debug(
+                        "[session=%s] Compaction check: %d items, nothing dropped"
+                        " (window=%s, token_budget=%s) | tokens: %d",
+                        session_id,
+                        original_count,
+                        effective_size,
+                        self._token_budget,
+                        original_tokens,
+                    )
+            else:
+                if dropped > 0:
+                    logger.info(
+                        "[session=%s] Compacted %d → %d items"
+                        " (dropped %d, limiting_factor=%s, window=%s, token_budget=%s)",
+                        session_id,
+                        original_count,
+                        len(compacted_items),
+                        dropped,
+                        limiting_factor,
+                        effective_size,
+                        self._token_budget,
+                    )
+                else:
+                    logger.debug(
+                        "[session=%s] Compaction check: %d items, nothing dropped"
+                        " (window=%s, token_budget=%s)",
+                        session_id,
+                        original_count,
+                        effective_size,
+                        self._token_budget,
+                    )
+
+        return {
+            "items": compacted_items,
+            "original_count": original_count,
+            "returned_count": len(compacted_items),
+            "limiting_factor": limiting_factor,
+            "summary_generated": False,
+            "metadata": {
+                "policy_type": "sliding_window",
+                "window_size": self._window_size,
+                "effective_window_size": effective_size,
+                "token_budget": self._token_budget,
+                "token_counter_type": type(self._token_counter).__name__
+                if self._token_counter
+                else None,
+                "original_tokens": original_tokens if should_compact else None,
+                "returned_tokens": returned_tokens,
+                "soft_limit_fired": soft_limit_fired,
+            },
+        }
+
+    def get_config(self) -> dict[str, object]:
+        """Return the current policy configuration."""
+        return {
+            "policy_type": "sliding_window",
+            "window_size": self._window_size,
+            "token_budget": self._token_budget,
+            "token_counter_type": type(self._token_counter).__name__
+            if self._token_counter
+            else None,
+        }
+
+
 class LocalCompactionSession(Session):
-    """Wraps a Session, optionally applying a sliding window on retrieval.
+    """Wraps a Session, optionally applying a compaction policy on retrieval.
 
     Write operations delegate directly; `get_items` can limit results to
-    the last `window_size` items.
+    the active policy's returned history.
 
     Note:
         This wrapper deliberately does **not** cache compaction results.
@@ -713,6 +988,8 @@ class LocalCompactionSession(Session):
             compaction. When set alongside ``window_size``, both constraints apply and
             compaction stops when **either** is exhausted. Requires ``token_counter``
             to be set (raises ``ValueError`` if ``token_counter=None``).
+        policy: Explicit compaction policy to use. When provided, the legacy
+            ``window_size``, ``token_counter``, and ``token_budget`` arguments are ignored.
 
     Example:
         >>> from agents import SQLiteSession
@@ -748,6 +1025,7 @@ class LocalCompactionSession(Session):
         window_size: int | None = None,
         token_counter: Callable[[str], int] | None = _default_token_counter,
         token_budget: int | None = None,
+        policy: CompactionPolicy | None = None,
     ) -> None:
         """Initialize the LocalCompactionSession.
 
@@ -757,46 +1035,30 @@ class LocalCompactionSession(Session):
             token_counter: Callable that maps text to token count. Defaults to ~4 chars/token.
                           Pass None to disable (also disables token_budget enforcement).
             token_budget: Maximum tokens to keep. None disables token-budget compaction.
-                         Requires token_counter to be set.
-
-        Raises:
-            ValueError: If token_budget is set but token_counter is None.
-            ValueError: If token_budget is <= 0.
+                         Requires token_counter to be set unless ``policy`` is provided.
+            policy: Explicit compaction policy. When provided, legacy constructor
+                    arguments are ignored.
         """
-        if token_budget is not None and token_budget <= 0:
-            raise ValueError(f"token_budget must be a positive integer, got {token_budget!r}")
-        if token_budget is not None and token_counter is None:
-            raise ValueError(
-                "token_budget requires a token_counter; "
-                "pass token_counter=... or remove token_budget"
-            )
-
         self._session = session
-        self._window_size = window_size
-        self._token_counter = token_counter
-        self._token_budget = token_budget
-
-        if token_counter is None:
-            logger.debug("[session=%s] Token counting disabled", session.session_id)
+        self._policy: CompactionPolicy
+        if policy is None:
+            self._policy = SlidingWindowPolicy(
+                window_size=window_size,
+                token_counter=token_counter,
+                token_budget=token_budget,
+            )
+            _log_sliding_window_policy_configuration(
+                session.session_id,
+                token_counter,
+                token_budget,
+            )
         else:
-            encoding = getattr(token_counter, "encoding_name", None)
-            counter_name = type(token_counter).__name__
-            budget_info = f" | token_budget={token_budget}" if token_budget is not None else ""
-            if encoding:
-                logger.debug(
-                    "[session=%s] Token counting: %s (%s)%s",
-                    session.session_id,
-                    counter_name,
-                    encoding,
-                    budget_info,
-                )
-            else:
-                logger.debug(
-                    "[session=%s] Token counting: %s%s",
-                    session.session_id,
-                    counter_name,
-                    budget_info,
-                )
+            self._policy = policy
+            policy_type = self._policy.get_config().get(
+                "policy_type",
+                type(self._policy).__name__,
+            )
+            logger.debug("[session=%s] Compaction policy: %s", session.session_id, policy_type)
 
     @property
     def session_id(self) -> str:
@@ -811,148 +1073,30 @@ class LocalCompactionSession(Session):
     async def get_items(self, limit: int | None = None) -> list[TResponseInputItem]:
         """Retrieve the conversation history from the underlying session.
 
-        Applies boundary-aware compaction to maintain function call pair atomicity.
-        When both window_size and limit are set, uses min(window_size, limit)
-        to ensure function call pairs are never split.
+        Fetches the full history from the underlying session, then forwards it to the
+        active policy. The returned list is validated to ensure function call pair
+        atomicity before being exposed to callers.
 
         Args:
-            limit: Maximum number of items to retrieve. If None, retrieves all items
-                   (subject to window_size constraint).
-                   Combined with window_size via effective_size = min(window, limit).
-                   Note: even when window_size is None, passing a limit will trigger
-                   _boundary_aware_compact() to ensure function call pair atomicity.
+            limit: Optional caller-supplied limit forwarded to the active policy.
 
         Returns:
             List of input items representing the conversation history.
             Function call pairs (function_call + function_call_output) are always atomic.
         """
-        # Combine window_size and limit to maintain atomicity
-        effective_size: int | None
-        if self._window_size is not None and limit is not None:
-            effective_size = min(self._window_size, limit)
-        elif self._window_size is not None:
-            effective_size = self._window_size
-        elif limit is not None:
-            effective_size = limit
-        else:
-            effective_size = None
-
         # Fetch from underlying — needed for compaction
         # NOTE: We fetch ALL items because boundary-aware compaction needs the full
         # history to correctly identify and preserve function call pairs.
         items = await self._session.get_items()
-
-        should_compact = effective_size is not None or self._token_budget is not None
-        if should_compact:
-            original_count = len(items)
-            # Compute per-item token costs when either token logging or token_budget needs them.
-            # Keyed by original index — robust even if compaction copies/reorders items.
-            item_tokens_by_index: list[int] | None = None
-            original_tokens = 0
-            if self._token_counter is not None:
-                item_tokens_by_index = []
-                for item in items:
-                    text = _extract_text(item)
-                    raw = self._token_counter(text)
-                    if raw <= 0:
-                        # Counter returned an invalid value. Note: unrecognisable item
-                        # shapes (empty text from _extract_text) are logged at DEBUG in
-                        # _extract_text; this WARNING covers a misbehaving counter, not
-                        # an unknown item shape (DefaultTokenCounter clamps internally).
-                        logger.warning(
-                            "token_counter returned %d for text %r; clamping to 1",
-                            raw,
-                            text[:50],
-                        )
-                        raw = 1
-                    item_tokens_by_index.append(raw + 4)
-                original_tokens = sum(item_tokens_by_index)
-
-            # Use internal function to get both items and their original indices
-            items, kept_indices, soft_limit_fired = _boundary_aware_compact_with_indices(
-                items,
-                window_size=effective_size,
-                item_tokens_by_index=item_tokens_by_index,
-                token_budget=self._token_budget,
-            )
-            dropped = original_count - len(items)
-
-            limiting_factor = _determine_limiting_factor(
-                items_before=original_count,
-                items_after=len(items),
-                item_budget=effective_size,
-                tokens_before=original_tokens,
-                token_budget=self._token_budget,
-                soft_limit_fired=soft_limit_fired,
-            )
-
-            if self._token_counter is not None and item_tokens_by_index is not None:
-                # Sum tokens for kept indices. Note: drop_orphaned_tool_outputs runs
-                # after this and may remove additional items, so compacted_tokens can
-                # be slightly inflated if orphans are present. Intentional approximation
-                # — this is observability only, not a correctness concern.
-                compacted_tokens = sum(item_tokens_by_index[i] for i in kept_indices)
-                token_reduction_pct = (
-                    (original_tokens - compacted_tokens) / original_tokens * 100
-                    if original_tokens > 0
-                    else 0.0
-                )
-                if dropped > 0:
-                    logger.info(
-                        "[session=%s] Compacted %d → %d items"
-                        " (dropped %d, limiting_factor=%s, window=%s, token_budget=%s)"
-                        " | tokens: %d → %d (%.1f%% reduction)",
-                        self.session_id,
-                        original_count,
-                        len(items),
-                        dropped,
-                        limiting_factor,
-                        effective_size,
-                        self._token_budget,
-                        original_tokens,
-                        compacted_tokens,
-                        token_reduction_pct,
-                    )
-                else:
-                    logger.debug(
-                        "[session=%s] Compaction check: %d items, nothing dropped"
-                        " (window=%s, token_budget=%s) | tokens: %d",
-                        self.session_id,
-                        original_count,
-                        effective_size,
-                        self._token_budget,
-                        original_tokens,
-                    )
-            else:
-                if dropped > 0:
-                    logger.info(
-                        "[session=%s] Compacted %d → %d items"
-                        " (dropped %d, limiting_factor=%s, window=%s, token_budget=%s)",
-                        self.session_id,
-                        original_count,
-                        len(items),
-                        dropped,
-                        limiting_factor,
-                        effective_size,
-                        self._token_budget,
-                    )
-                else:
-                    logger.debug(
-                        "[session=%s] Compaction check: %d items, nothing dropped"
-                        " (window=%s, token_budget=%s)",
-                        self.session_id,
-                        original_count,
-                        effective_size,
-                        self._token_budget,
-                    )
+        result = await self._policy.compact(items, session_id=self.session_id, limit=limit)
 
         # NOTE: This call is intentional as a defense-in-depth safety validator.
-        # It ensures that any edge cases missed by _boundary_aware_compact are caught.
-        # Runs even when no compaction happened (len(items) <= window_size) because
-        # orphans could exist in the source data regardless of compaction.
+        # It ensures that any edge cases missed by the active policy are caught.
+        # Runs even when the active policy already validates history because orphans
+        # could exist in source data or be introduced by a custom policy.
         # drop_orphaned_tool_outputs emits DEBUG logs for anything it removes,
         # so drops are visible in logs regardless of whether compaction was active.
-        return drop_orphaned_tool_outputs(items)
+        return drop_orphaned_tool_outputs(result["items"])
 
     async def add_items(self, items: list[TResponseInputItem]) -> None:
         """Add new items to the underlying session's conversation history.
@@ -976,24 +1120,19 @@ class LocalCompactionSession(Session):
 
     def __repr__(self) -> str:
         """Return string representation for debugging."""
-        return (
-            f"<LocalCompactionSession("
-            f"session_id={self.session_id!r}, "
-            f"window_size={self._window_size}, "
-            f"token_budget={self._token_budget})>"
-        )
+        policy_config = self._policy.get_config()
+        policy_type = policy_config.get("policy_type", type(self._policy).__name__)
+        parts = [f"session_id={self.session_id!r}", f"policy_type={policy_type!r}"]
+        if "window_size" in policy_config:
+            parts.append(f"window_size={policy_config['window_size']}")
+        if "token_budget" in policy_config:
+            parts.append(f"token_budget={policy_config['token_budget']}")
+        return f"<LocalCompactionSession({', '.join(parts)})>"
 
     def get_compaction_config(self) -> dict[str, object]:
         """Get current compaction configuration.
 
         Returns:
-            Dict with keys: session_id, window_size, token_budget, token_counter_type.
+            Dict with the session_id and the active policy's public configuration.
         """
-        return {
-            "session_id": self.session_id,
-            "window_size": self._window_size,
-            "token_budget": self._token_budget,
-            "token_counter_type": type(self._token_counter).__name__
-            if self._token_counter
-            else None,
-        }
+        return {"session_id": self.session_id, **self._policy.get_config()}
