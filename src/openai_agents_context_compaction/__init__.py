@@ -12,6 +12,7 @@ from openai_agents_context_compaction.session import (
     HistorySummarizer,
     LocalCompactionSession,
     SlidingWindowPolicy,
+    SummarizingPolicy,
     TiktokenCounter,
 )
 
@@ -23,5 +24,6 @@ __all__ = [
     "HistorySummarizer",
     "LocalCompactionSession",
     "SlidingWindowPolicy",
+    "SummarizingPolicy",
     "TiktokenCounter",
 ]

@@ -95,7 +95,9 @@ from the end and work back until we've filled the window.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from collections.abc import Callable
 from typing import Protocol, TypedDict
 
@@ -143,7 +145,20 @@ class HistorySummarizer(Protocol):
         target_tokens: int | None = None,
         existing_summary: str | None = None,
     ) -> TResponseInputItem:
-        """Return one synthetic history item summarizing the provided items."""
+        """Return one synthetic history item summarising the provided items.
+
+        Args:
+            items: The prefix items to compress into a summary.
+            session_id: The session identifier, passed for logging or tracing.
+            target_tokens: Approximate token budget for the returned summary item.
+                The summariser should aim to stay within this budget. Callers treat
+                it as a hint; exceeding it produces a warning, not an error.
+            existing_summary: Text of a prior summary produced for this session, if
+                one exists. Implementations may use it to produce an incremental update
+                rather than summarising from scratch. Not currently passed by
+                ``SummarizingPolicy``; reserved for a future incremental-summarisation
+                extension.
+        """
 
 
 class DefaultTokenCounter:
@@ -958,6 +973,239 @@ class SlidingWindowPolicy:
         }
 
 
+class SummarizingPolicy:
+    """Boundary-aware summarising compaction policy.
+
+    Keeps a recent raw tail of history and summarises the older prefix into one
+    synthetic history item returned by the injected ``HistorySummarizer``.
+
+    Falls back to ``SlidingWindowPolicy`` (with the same tail budget) when:
+    - the prefix is shorter than ``min_items_to_summarize``
+    - summarisation raises an exception or times out
+
+    The fallback is always bounded (sliding-window), never unbounded raw history.
+
+    Args:
+        summarizer: Provider-agnostic callable that turns a prefix list into one
+            synthetic history item.
+        retain_recent_items: Max items to keep in the raw tail (None = unlimited).
+        retain_recent_token_budget: Max tokens to keep in the raw tail (None = unlimited).
+            Requires ``token_counter`` to be set.
+        summary_target_tokens: Hint passed to the summariser for how long to make
+            the summary. Logged as a warning if the returned item exceeds this.
+        min_items_to_summarize: Minimum prefix length to bother summarising.
+            Shorter prefixes fall through to sliding-window compaction.
+        summary_timeout_seconds: Seconds before the summariser call is cancelled.
+        token_counter: Callable mapping text to token count. Defaults to ~4 chars/token.
+            Pass ``None`` to disable token counting (also disables token-budget retention).
+        fallback_to_sliding_window: When ``True`` (default), a summariser exception or
+            timeout falls back to ``SlidingWindowPolicy``. When ``False``, the exception
+            propagates to the caller instead.
+    """
+
+    def __init__(
+        self,
+        summarizer: HistorySummarizer,
+        *,
+        retain_recent_items: int | None = 20,
+        retain_recent_token_budget: int | None = 20000,
+        summary_target_tokens: int = 1500,
+        min_items_to_summarize: int = 8,
+        summary_timeout_seconds: float = 5.0,
+        token_counter: Callable[[str], int] | None = _default_token_counter,
+        fallback_to_sliding_window: bool = True,
+    ) -> None:
+        if retain_recent_token_budget is not None and token_counter is None:
+            raise ValueError(
+                "retain_recent_token_budget requires a token_counter; "
+                "pass token_counter=... or remove retain_recent_token_budget"
+            )
+
+        self._summarizer = summarizer
+        self._retain_recent_items = retain_recent_items
+        self._retain_recent_token_budget = retain_recent_token_budget
+        self._summary_target_tokens = summary_target_tokens
+        self._min_items_to_summarize = min_items_to_summarize
+        self._summary_timeout_seconds = summary_timeout_seconds
+        self._token_counter = token_counter
+        self._fallback_to_sliding_window = fallback_to_sliding_window
+
+    def _build_fallback_policy(self) -> SlidingWindowPolicy:
+        return SlidingWindowPolicy(
+            window_size=self._retain_recent_items,
+            token_counter=self._token_counter,
+            token_budget=self._retain_recent_token_budget,
+        )
+
+    async def compact(
+        self,
+        items: list[TResponseInputItem],
+        *,
+        session_id: str,
+        limit: int | None = None,
+    ) -> CompactionResult:
+        """Summarise the older prefix and return ``[summary_item] + recent_tail``."""
+        original_count = len(items)
+
+        if not items:
+            return {
+                "items": [],
+                "original_count": 0,
+                "returned_count": 0,
+                "limiting_factor": None,
+                "summary_generated": False,
+                "metadata": {"policy_type": "summary_window"},
+            }
+
+        # Determine effective tail size, respecting caller-supplied limit.
+        effective_retain_items: int | None
+        if self._retain_recent_items is not None and limit is not None:
+            effective_retain_items = min(self._retain_recent_items, limit)
+        elif self._retain_recent_items is not None:
+            effective_retain_items = self._retain_recent_items
+        elif limit is not None:
+            effective_retain_items = limit
+        else:
+            effective_retain_items = None
+
+        item_tokens_by_index, _ = _build_item_token_costs(items, self._token_counter)
+
+        tail_items, tail_indices, _ = _boundary_aware_compact_with_indices(
+            items,
+            window_size=effective_retain_items,
+            item_tokens_by_index=item_tokens_by_index,
+            token_budget=self._retain_recent_token_budget,
+        )
+
+        # Nothing dropped — no summarisation needed.
+        if len(tail_items) == original_count:
+            return {
+                "items": list(items),
+                "original_count": original_count,
+                "returned_count": original_count,
+                "limiting_factor": None,
+                "summary_generated": False,
+                "metadata": {
+                    "policy_type": "summary_window",
+                    "summary_skipped_reason": "nothing_to_summarize",
+                },
+            }
+
+        # Prefix = everything strictly before the first retained tail index.
+        # Items between tail_indices that were dropped by boundary-aware logic
+        # (e.g. orphaned tool calls) are also excluded from the prefix so we
+        # never summarise an incomplete tool-call pair.
+        split_point = min(tail_indices) if tail_indices else original_count
+        items_to_summarize = items[:split_point]
+
+        # Gate: prefix too short to be worth a summariser call.
+        if len(items_to_summarize) < self._min_items_to_summarize:
+            logger.debug(
+                "[session=%s] Skipping summarisation: prefix has %d items "
+                "(min_items_to_summarize=%d); falling back to sliding window",
+                session_id,
+                len(items_to_summarize),
+                self._min_items_to_summarize,
+            )
+            return await self._build_fallback_policy().compact(
+                items, session_id=session_id, limit=limit
+            )
+
+        # Attempt summarisation with timeout.
+        start = time.monotonic()
+        try:
+            summary_item = await asyncio.wait_for(
+                self._summarizer.summarize(
+                    items_to_summarize,
+                    session_id=session_id,
+                    target_tokens=self._summary_target_tokens,
+                ),
+                timeout=self._summary_timeout_seconds,
+            )
+        except Exception as exc:
+            latency_ms = (time.monotonic() - start) * 1000
+            if not self._fallback_to_sliding_window:
+                logger.warning(
+                    "[session=%s] Summarisation failed after %.1fms (%s: %s); "
+                    "re-raising (fallback_to_sliding_window=False)",
+                    session_id,
+                    latency_ms,
+                    type(exc).__name__,
+                    exc,
+                )
+                raise
+            logger.warning(
+                "[session=%s] Summarisation failed after %.1fms (%s: %s); "
+                "falling back to sliding window",
+                session_id,
+                latency_ms,
+                type(exc).__name__,
+                exc,
+            )
+            return await self._build_fallback_policy().compact(
+                items, session_id=session_id, limit=limit
+            )
+
+        latency_ms = (time.monotonic() - start) * 1000
+
+        # Warn if summary item is larger than the target.
+        if self._token_counter is not None:
+            summary_tokens = self._token_counter(_extract_text(summary_item)) + 4
+            if summary_tokens > self._summary_target_tokens:
+                logger.warning(
+                    "[session=%s] Summary token count %d exceeds target %d; proceeding anyway",
+                    session_id,
+                    summary_tokens,
+                    self._summary_target_tokens,
+                )
+        else:
+            summary_tokens = 0
+
+        result_items = [summary_item] + tail_items
+        returned_count = len(result_items)
+
+        logger.info(
+            "[session=%s] Summarised %d → %d items "
+            "(prefix=%d summarized, tail=%d kept raw, latency=%.1fms)",
+            session_id,
+            original_count,
+            returned_count,
+            len(items_to_summarize),
+            len(tail_items),
+            latency_ms,
+        )
+
+        return {
+            "items": result_items,
+            "original_count": original_count,
+            "returned_count": returned_count,
+            "limiting_factor": None,
+            "summary_generated": True,
+            "metadata": {
+                "policy_type": "summary_window",
+                "items_summarized": len(items_to_summarize),
+                "tail_items_kept": len(tail_items),
+                "summary_latency_ms": latency_ms,
+                "summary_output_tokens": summary_tokens,
+                "summary_target_tokens": self._summary_target_tokens,
+            },
+        }
+
+    def get_config(self) -> dict[str, object]:
+        """Return the current policy configuration."""
+        return {
+            "policy_type": "summary_window",
+            "retain_recent_items": self._retain_recent_items,
+            "retain_recent_token_budget": self._retain_recent_token_budget,
+            "summary_target_tokens": self._summary_target_tokens,
+            "min_items_to_summarize": self._min_items_to_summarize,
+            "summary_timeout_seconds": self._summary_timeout_seconds,
+            "token_counter_type": type(self._token_counter).__name__
+            if self._token_counter
+            else None,
+        }
+
+
 class LocalCompactionSession(Session):
     """Wraps a Session, optionally applying a compaction policy on retrieval.
 
@@ -1054,6 +1302,19 @@ class LocalCompactionSession(Session):
             )
         else:
             self._policy = policy
+            _legacy_args: list[str] = []
+            if window_size is not None:
+                _legacy_args.append(f"window_size={window_size!r}")
+            if token_budget is not None:
+                _legacy_args.append(f"token_budget={token_budget!r}")
+            if token_counter is not _default_token_counter:
+                _legacy_args.append("token_counter=<custom>")
+            if _legacy_args:
+                logger.warning(
+                    "[session=%s] policy= was provided; ignoring legacy arguments: %s",
+                    session.session_id,
+                    ", ".join(_legacy_args),
+                )
             policy_type = self._policy.get_config().get(
                 "policy_type",
                 type(self._policy).__name__,
