@@ -580,7 +580,10 @@ def _boundary_aware_compact_with_indices(
                         call_id,
                     )
                 else:
-                    logger.debug("Dropping orphaned function_call_output with call_id=%s", call_id)
+                    logger.debug(
+                        "Dropping orphaned function_call_output with call_id=%s",
+                        call_id,
+                    )
             continue
 
         if _is_function_call(current_item):

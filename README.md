@@ -26,7 +26,7 @@ As agent conversations grow longer, token counts sent to the LLM increase, leadi
 
 This package extends the existing OpenAI Agents SDK `Session` protocol with **local compaction strategies**, making it **provider-agnostic** and independent of the OpenAI Responses API compaction endpoint.
 
-> ⚠️ **Early-stage alpha:** The current release implements a minimal sliding window approach. Future releases will add token-aware, LLM-based, and pluggable strategies (see [Roadmap](#roadmap)).
+> ⚠️ **Early-stage alpha:** The current release implements sliding window and LLM summarisation strategies behind a pluggable policy interface (see [Roadmap](#roadmap)).
 
 ---
 
@@ -140,24 +140,87 @@ The default `token_counter` uses ~4 chars/token (no dependencies). For accurate 
 
 The OpenAI Agents SDK stores session data in [Responses API format](https://platform.openai.com/docs/api-reference/responses). Tool calls appear as separate `function_call` and `function_call_output` items matched by `call_id`. This package handles this transparently.
 
-### Performance Considerations
+### LLM-based summarisation
+
+Use `SummarizingPolicy` to compress older conversation history into a single summary item while keeping the most recent turns raw. The policy requires a `HistorySummarizer` implementation that you provide — any LLM or service that can condense a list of messages works.
+
+```python
+from agents import TResponseInputItem
+from openai_agents_context_compaction import (
+    LocalCompactionSession,
+    SummarizingPolicy,
+)
+
+
+class MyOpenAISummarizer:
+    """Example summarizer using the OpenAI Chat API."""
+
+    async def summarize(
+        self,
+        items: list[TResponseInputItem],
+        *,
+        session_id: str,
+        target_tokens: int | None = None,
+        existing_summary: str | None = None,
+    ) -> TResponseInputItem:
+        # Call your LLM to produce a summary of `items`.
+        # Return a single synthetic message item.
+        summary_text = await call_openai(items, max_tokens=target_tokens)
+        return {
+            "role": "assistant",
+            "type": "message",
+            "content": [{"type": "output_text", "text": summary_text}],
+        }
+
+
+policy = SummarizingPolicy(
+    MyOpenAISummarizer(),
+    retain_recent_items=20,            # keep last 20 items raw
+    retain_recent_token_budget=20000,   # or stop at 20k tokens
+    summary_target_tokens=1500,         # hint for summary length
+    min_items_to_summarize=8,           # skip summarisation for short prefixes
+    summary_timeout_seconds=5.0,        # cancel if summariser is too slow
+)
+
+session = LocalCompactionSession(underlying, policy=policy)
+```
+
+When `get_items()` is called, the policy:
+
+1. Computes a boundary-aware tail (respecting function-call-pair atomicity)
+2. Sends the older prefix to the summariser
+3. Returns `[summary_item] + recent_tail`
+
+If the summariser raises or times out, the policy falls back to `SlidingWindowPolicy` with the same tail budget (set `fallback_to_sliding_window=False` to propagate the exception instead).
+
+### Custom policies
+
+You can pass any object implementing the `CompactionPolicy` protocol:
+
+```python
+session = LocalCompactionSession(underlying, policy=my_custom_policy)
+```
+
+See `CompactionPolicy` and `CompactionResult` in the [Future Considerations](#future-considerations) section for the full interface.
+
+### Performance considerations
 
 For very large sessions (thousands of items), compaction runs on every `get_items()` call. No in-process cache is kept — each call fetches from the underlying session to avoid stale reads when the session is backed by a shared database with concurrent writers. The compaction algorithm itself is O(n) where n is the total session size. If performance becomes a concern:
 
 - Consider periodic session pruning at the storage layer
-- Use a reasonable `window_size` that balances context retention with processing cost
+- Use a reasonable `window_size` or `retain_recent_items` that balances context retention with processing cost
 
 ---
 
 ## Roadmap
 
-| Feature                       | Status                                    |
-| ----------------------------- | ----------------------------------------- |
-| Sliding window compaction     | ✅ Implemented                            |
-| Token-based limits            | ✅ Implemented (`token_budget` parameter) |
-| LLM-based summarization       | 🟡 Planned                                |
-| Write-time compaction         | 🟡 Planned                                |
-| Pluggable compaction policies | 🟡 Planned                                |
+| Feature                       | Status                                              |
+| ----------------------------- | --------------------------------------------------- |
+| Sliding window compaction     | ✅ Implemented (`SlidingWindowPolicy`)              |
+| Token-based limits            | ✅ Implemented (`token_budget` parameter)           |
+| Pluggable compaction policies | ✅ Implemented (`CompactionPolicy` protocol)        |
+| LLM-based summarisation       | ✅ Implemented (`SummarizingPolicy`)                |
+| Write-time compaction         | 🟡 Planned                                          |
 
 ---
 
@@ -186,16 +249,17 @@ If compaction runs at write-time, incomplete pairs may be dropped, breaking sess
 
 The following ideas are documented for future reference. Build them when there's a concrete need:
 
-| Feature                        | Add when...                                                  |
-| ------------------------------ | ------------------------------------------------------------ |
-| **Time-based window**          | Sessions span days and old context becomes stale             |
-| **Importance scoring**         | Tool outputs vary wildly in value                            |
-| **Additional policy types**    | The built-in sliding window needs strategy-specific peers    |
-| **Role-based prioritization**  | Certain messages must never be evicted                       |
-| **Hybrid window**              | Last N items + always keep M most recent function call pairs |
+| Feature                        | Add when...                                              |
+| ------------------------------ | -------------------------------------------------------- |
+| **Time-based window**          | Sessions span days and old context becomes stale         |
+| **Importance scoring**         | Tool outputs vary wildly in value                        |
+| **Role-based prioritisation**  | Certain messages must never be evicted                   |
+| **Hybrid window**              | Last N items + always keep M most recent function pairs  |
+| **Incremental summarisation**  | Long-running sessions need repeated re-summarisation     |
 
-The library now exposes an async policy interface with `SlidingWindowPolicy`
-as the built-in default. Custom policies can implement the same contract:
+### Policy interface
+
+The library exposes an async `CompactionPolicy` protocol. The built-in policies (`SlidingWindowPolicy`, `SummarizingPolicy`) implement it, and custom policies can do the same:
 
 ```python
 class CompactionResult(TypedDict):
@@ -220,6 +284,18 @@ class CompactionPolicy(Protocol):
     def get_config(self) -> dict[str, object]:
         """Return a serializable description of the policy configuration."""
         ...
+
+
+class HistorySummarizer(Protocol):
+    async def summarize(
+        self,
+        items: list[TResponseInputItem],
+        *,
+        session_id: str,
+        target_tokens: int | None = None,
+        existing_summary: str | None = None,
+    ) -> TResponseInputItem:
+        """Return one synthetic history item summarising the provided items."""
 ```
 
 ---

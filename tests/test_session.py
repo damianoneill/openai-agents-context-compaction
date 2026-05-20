@@ -103,7 +103,12 @@ def function_call(
 ) -> TResponseInputItem:
     return cast(
         TResponseInputItem,
-        {"type": "function_call", "call_id": call_id, "name": name, "arguments": arguments},
+        {
+            "type": "function_call",
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments,
+        },
     )
 
 
@@ -397,7 +402,8 @@ class TestLocalCompactionSession:
         """
         mock = MockSession()
         unknown_item = cast(
-            TResponseInputItem, {"type": "future_reasoning_item", "content": "thinking..."}
+            TResponseInputItem,
+            {"type": "future_reasoning_item", "content": "thinking..."},
         )
         valid_msg = user_msg("valid message")
         await mock.add_items([user_msg("older"), unknown_item, valid_msg])
@@ -419,7 +425,8 @@ class TestLocalCompactionSession:
         """
         mock = MockSession()
         unknown_item = cast(
-            TResponseInputItem, {"type": "future_reasoning_item", "content": "thinking..."}
+            TResponseInputItem,
+            {"type": "future_reasoning_item", "content": "thinking..."},
         )
         await mock.add_items([user_msg("older"), unknown_item, user_msg("valid message")])
         compacting = LocalCompactionSession(mock, window_size=2)
@@ -967,7 +974,9 @@ class TestTokenBudgetCompaction:
         assert items[0] == user_msg("msg4")
 
     @pytest.mark.asyncio
-    async def test_interleaved_message_between_pair_dropped_by_token_budget(self) -> None:
+    async def test_interleaved_message_between_pair_dropped_by_token_budget(
+        self,
+    ) -> None:
         """A message interleaved between fc and fco is independently token-budget-accounted.
 
         mid_msg sits between fc and fco in the list, but is NOT treated as part of the pair.
