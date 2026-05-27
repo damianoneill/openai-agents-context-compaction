@@ -387,6 +387,105 @@ def _is_conversation_message(item: TResponseInputItem) -> bool:
     return item.get("role") in ("user", "assistant")
 
 
+def _is_user_message(item: TResponseInputItem) -> bool:
+    """Check if item is a user message (start of a turn)."""
+    return item.get("role") == "user"
+
+
+def _find_turn_start_indices(items: list[TResponseInputItem]) -> list[int]:
+    """Find indices where each turn begins (i.e., user message positions).
+
+    A turn is defined as a user message plus all subsequent items
+    (assistant messages, tool calls, tool outputs) until the next user message.
+
+    Returns a list of indices in ascending order. Each index marks the start
+    of a turn.
+    """
+    return [i for i, item in enumerate(items) if _is_user_message(item)]
+
+
+def _turn_aware_tail_selection(
+    items: list[TResponseInputItem],
+    retain_recent_turns: int,
+    item_tokens_by_index: list[int] | None = None,
+    token_budget: int | None = None,
+) -> tuple[int, int, str | None]:
+    """Select tail items based on turn boundaries with floor+ceiling semantics.
+
+    Args:
+        items: Full conversation history.
+        retain_recent_turns: MINIMUM turns to keep (floor - always guaranteed).
+        item_tokens_by_index: Pre-computed token cost per item.
+        token_budget: Maximum tokens for expansion beyond minimum (ceiling).
+
+    Returns:
+        Tuple of (split_index, kept_turns, limiting_factor) where:
+        - split_index: The index where the tail starts (items[split_index:] are kept)
+        - kept_turns: Number of complete turns in the tail
+        - limiting_factor: "turn_floor" if minimum applied, "token_budget" if
+          budget limited expansion, None if all history kept.
+
+    Algorithm:
+        1. Always include at least `retain_recent_turns` complete turns (FLOOR)
+        2. Walk backward through older turns, adding each if cumulative
+           tokens <= token_budget
+        3. Stop when next turn would exceed budget
+        4. Boundary always snaps to user message (never mid-turn)
+    """
+    if not items:
+        return 0, 0, None
+
+    turn_starts = _find_turn_start_indices(items)
+    if not turn_starts:
+        # No user messages = no turns; keep everything
+        return 0, 0, None
+
+    total_turns = len(turn_starts)
+
+    # Start with minimum floor turns
+    floor_turns = min(retain_recent_turns, total_turns)
+
+    # If floor already covers everything, return all
+    if floor_turns >= total_turns:
+        return 0, total_turns, None
+
+    # Calculate the split point for minimum floor
+    # We want the last `floor_turns` turns, so start from turn_starts[-floor_turns]
+    floor_split = turn_starts[-floor_turns] if floor_turns > 0 else len(items)
+
+    # If no token budget, just use the floor
+    if token_budget is None or item_tokens_by_index is None:
+        return floor_split, floor_turns, "turn_floor"
+
+    # Calculate tokens for floor turns
+    floor_tokens = sum(item_tokens_by_index[floor_split:])
+
+    # Try to expand beyond floor if budget allows
+    kept_turns = floor_turns
+    current_split = floor_split
+    current_tokens = floor_tokens
+
+    # Walk backward through earlier turns
+    for extra_turns in range(1, total_turns - floor_turns + 1):
+        candidate_turns = floor_turns + extra_turns
+        candidate_split = turn_starts[-candidate_turns]
+
+        # Calculate tokens for this turn (from candidate_split to current_split)
+        turn_tokens = sum(item_tokens_by_index[candidate_split:current_split])
+
+        if current_tokens + turn_tokens <= token_budget:
+            # This turn fits, include it
+            current_tokens += turn_tokens
+            current_split = candidate_split
+            kept_turns = candidate_turns
+        else:
+            # Budget exhausted, stop expansion
+            return current_split, kept_turns, "token_budget"
+
+    # All turns fit within budget
+    return 0, total_turns, None
+
+
 class _CallIndices(TypedDict):
     """Indices for a function call pair (call and output).
 
@@ -982,23 +1081,39 @@ class SummarizingPolicy:
     Keeps a recent raw tail of history and summarises the older prefix into one
     synthetic history item returned by the injected ``HistorySummarizer``.
 
-    Falls back to ``SlidingWindowPolicy`` (with the same tail budget) when:
-    - the prefix is shorter than ``min_items_to_summarize``
+    Falls back to ``SlidingWindowPolicy`` (token-budget only) when:
     - summarisation raises an exception or times out
 
     The fallback is always bounded (sliding-window), never unbounded raw history.
 
+    Turn-Based Retention (floor + ceiling semantics):
+        - A "turn" is a user message plus all subsequent items (assistant messages,
+          tool calls, tool outputs) until the next user message.
+        - ``retain_recent_turns`` is the MINIMUM FLOOR: this many turns are always
+          guaranteed, regardless of token budget.
+        - ``retain_recent_token_budget`` is the CEILING: used to expand beyond the
+          minimum floor if budget allows, but does not reduce below the floor.
+
+        Example with retain_recent_turns=2, token_budget=20000:
+        - Turn 1 (5K) + Turn 2 (5K) → keep both (10K, minimum met)
+        - Turn 1 (21K) + Turn 2 (5K) → keep both (26K, minimum guaranteed even if over)
+        - Turn 1 (3K) + Turn 2 (3K) + Turn 3 (15K) → keep 2+3, try Turn 1: exceeds → keep 2
+
     Args:
         summarizer: Provider-agnostic callable that turns a prefix list into one
             synthetic history item.
-        retain_recent_items: Max items to keep in the raw tail (None = unlimited).
-        retain_recent_token_budget: Max tokens to keep in the raw tail (None = unlimited).
-            Requires ``token_counter`` to be set.
+        retain_recent_turns: Minimum turns to keep (floor). A turn is a user
+            message plus all subsequent items until the next user message.
+        retain_recent_token_budget: Max tokens for tail expansion (ceiling).
+            Caps expansion beyond the minimum floor. Requires ``token_counter``.
         summary_target_tokens: Hint passed to the summariser for how long to make
             the summary. Logged as a warning if the returned item exceeds this.
-        min_items_to_summarize: Minimum prefix length to bother summarising.
-            Shorter prefixes fall through to sliding-window compaction.
         summary_timeout_seconds: Seconds before the summariser call is cancelled.
+        summarizer_input_token_limit: Maximum tokens to send to the summariser.
+            If the prefix exceeds this limit, the oldest items are dropped
+            (keeping boundary-aware pairs intact) until the prefix fits. This
+            prevents sending a prefix that exceeds the summariser model's context
+            window. ``None`` disables truncation. Requires ``token_counter``.
         token_counter: Callable mapping text to token count. Defaults to ~4 chars/token.
             Pass ``None`` to disable token counting (also disables token-budget retention).
         fallback_to_sliding_window: When ``True`` (default), a summariser exception or
@@ -1010,11 +1125,11 @@ class SummarizingPolicy:
         self,
         summarizer: HistorySummarizer,
         *,
-        retain_recent_items: int | None = 20,
+        retain_recent_turns: int = 2,
         retain_recent_token_budget: int | None = 20000,
         summary_target_tokens: int = 1500,
-        min_items_to_summarize: int = 8,
         summary_timeout_seconds: float = 5.0,
+        summarizer_input_token_limit: int | None = 60_000,
         token_counter: Callable[[str], int] | None = _default_token_counter,
         fallback_to_sliding_window: bool = True,
     ) -> None:
@@ -1023,19 +1138,24 @@ class SummarizingPolicy:
                 "retain_recent_token_budget requires a token_counter; "
                 "pass token_counter=... or remove retain_recent_token_budget"
             )
+        if summarizer_input_token_limit is not None and token_counter is None:
+            raise ValueError(
+                "summarizer_input_token_limit requires a token_counter; "
+                "pass token_counter=... or remove summarizer_input_token_limit"
+            )
 
         self._summarizer = summarizer
-        self._retain_recent_items = retain_recent_items
+        self._retain_recent_turns = retain_recent_turns
         self._retain_recent_token_budget = retain_recent_token_budget
         self._summary_target_tokens = summary_target_tokens
-        self._min_items_to_summarize = min_items_to_summarize
         self._summary_timeout_seconds = summary_timeout_seconds
+        self._summarizer_input_token_limit = summarizer_input_token_limit
         self._token_counter = token_counter
         self._fallback_to_sliding_window = fallback_to_sliding_window
 
     def _build_fallback_policy(self) -> SlidingWindowPolicy:
         return SlidingWindowPolicy(
-            window_size=self._retain_recent_items,
+            window_size=None,  # No item limit, rely on token budget
             token_counter=self._token_counter,
             token_budget=self._retain_recent_token_budget,
         )
@@ -1060,28 +1180,19 @@ class SummarizingPolicy:
                 "metadata": {"policy_type": "summary_window"},
             }
 
-        # Determine effective tail size, respecting caller-supplied limit.
-        effective_retain_items: int | None
-        if self._retain_recent_items is not None and limit is not None:
-            effective_retain_items = min(self._retain_recent_items, limit)
-        elif self._retain_recent_items is not None:
-            effective_retain_items = self._retain_recent_items
-        elif limit is not None:
-            effective_retain_items = limit
-        else:
-            effective_retain_items = None
-
         item_tokens_by_index, _ = _build_item_token_costs(items, self._token_counter)
 
-        tail_items, tail_indices, _ = _boundary_aware_compact_with_indices(
+        # Turn-aware tail selection with floor+ceiling semantics
+        split_point, kept_turns, limiting_factor = _turn_aware_tail_selection(
             items,
-            window_size=effective_retain_items,
+            retain_recent_turns=self._retain_recent_turns,
             item_tokens_by_index=item_tokens_by_index,
             token_budget=self._retain_recent_token_budget,
         )
+        tail_items = items[split_point:]
 
         # Nothing dropped — no summarisation needed.
-        if len(tail_items) == original_count:
+        if split_point == 0:
             return {
                 "items": list(items),
                 "original_count": original_count,
@@ -1091,28 +1202,41 @@ class SummarizingPolicy:
                 "metadata": {
                     "policy_type": "summary_window",
                     "summary_skipped_reason": "nothing_to_summarize",
+                    "turns_kept": kept_turns,
                 },
             }
 
-        # Prefix = everything strictly before the first retained tail index.
-        # Items between tail_indices that were dropped by boundary-aware logic
-        # (e.g. orphaned tool calls) are also excluded from the prefix so we
-        # never summarise an incomplete tool-call pair.
-        split_point = min(tail_indices) if tail_indices else original_count
         items_to_summarize = items[:split_point]
 
-        # Gate: prefix too short to be worth a summariser call.
-        if len(items_to_summarize) < self._min_items_to_summarize:
-            logger.debug(
-                "[session=%s] Skipping summarisation: prefix has %d items "
-                "(min_items_to_summarize=%d); falling back to sliding window",
-                session_id,
-                len(items_to_summarize),
-                self._min_items_to_summarize,
+        # Truncate prefix to summarizer_input_token_limit by dropping oldest items.
+        # This prevents sending a prefix that exceeds the summariser model's
+        # context window, which would waste latency and trigger fallback every turn.
+        if self._summarizer_input_token_limit is not None and self._token_counter is not None:
+            prefix_tokens_by_index, prefix_total_tokens = _build_item_token_costs(
+                items_to_summarize, self._token_counter
             )
-            return await self._build_fallback_policy().compact(
-                items, session_id=session_id, limit=limit
-            )
+            if (
+                prefix_total_tokens > self._summarizer_input_token_limit
+                and prefix_tokens_by_index is not None
+            ):
+                original_prefix_count = len(items_to_summarize)
+                # Reuse boundary-aware compaction: walk backward (keeping newest),
+                # dropping oldest items first while preserving pair atomicity.
+                items_to_summarize, _, _ = _boundary_aware_compact_with_indices(
+                    items_to_summarize,
+                    window_size=None,
+                    item_tokens_by_index=prefix_tokens_by_index,
+                    token_budget=self._summarizer_input_token_limit,
+                )
+                logger.info(
+                    "[session=%s] Truncated summariser prefix %d → %d items "
+                    "(token limit=%d, original tokens=%d)",
+                    session_id,
+                    original_prefix_count,
+                    len(items_to_summarize),
+                    self._summarizer_input_token_limit,
+                    prefix_total_tokens,
+                )
 
         # Attempt summarisation with timeout.
         start = time.monotonic()
@@ -1178,31 +1302,36 @@ class SummarizingPolicy:
             latency_ms,
         )
 
+        metadata: dict[str, object] = {
+            "policy_type": "summary_window",
+            "items_summarized": len(items_to_summarize),
+            "tail_items_kept": len(tail_items),
+            "turns_kept": kept_turns,
+            "summary_latency_ms": latency_ms,
+            "summary_output_tokens": summary_tokens,
+            "summary_target_tokens": self._summary_target_tokens,
+        }
+        if limiting_factor is not None:
+            metadata["tail_limiting_factor"] = limiting_factor
+
         return {
             "items": result_items,
             "original_count": original_count,
             "returned_count": returned_count,
-            "limiting_factor": None,
+            "limiting_factor": limiting_factor,
             "summary_generated": True,
-            "metadata": {
-                "policy_type": "summary_window",
-                "items_summarized": len(items_to_summarize),
-                "tail_items_kept": len(tail_items),
-                "summary_latency_ms": latency_ms,
-                "summary_output_tokens": summary_tokens,
-                "summary_target_tokens": self._summary_target_tokens,
-            },
+            "metadata": metadata,
         }
 
     def get_config(self) -> dict[str, object]:
         """Return the current policy configuration."""
         return {
             "policy_type": "summary_window",
-            "retain_recent_items": self._retain_recent_items,
+            "retain_recent_turns": self._retain_recent_turns,
             "retain_recent_token_budget": self._retain_recent_token_budget,
             "summary_target_tokens": self._summary_target_tokens,
-            "min_items_to_summarize": self._min_items_to_summarize,
             "summary_timeout_seconds": self._summary_timeout_seconds,
+            "summarizer_input_token_limit": self._summarizer_input_token_limit,
             "token_counter_type": type(self._token_counter).__name__
             if self._token_counter
             else None,

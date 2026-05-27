@@ -1432,9 +1432,8 @@ class TestSummarizingPolicy:
         summarizer = CapturingSummarizer()
         policy = SummarizingPolicy(
             summarizer,
-            retain_recent_items=3,
+            retain_recent_turns=3,
             retain_recent_token_budget=None,
-            min_items_to_summarize=2,
         )
         items = [user_msg(f"msg {i}") for i in range(8)]
         result = await policy.compact(items, session_id="s1")
@@ -1455,9 +1454,8 @@ class TestSummarizingPolicy:
         summarizer = CapturingSummarizer()
         policy = SummarizingPolicy(
             summarizer,
-            retain_recent_items=2,
+            retain_recent_turns=2,
             retain_recent_token_budget=None,
-            min_items_to_summarize=1,
         )
         items = [user_msg("a"), user_msg("b"), user_msg("c"), user_msg("d")]
         result = await policy.compact(items, session_id="s2")
@@ -1470,9 +1468,8 @@ class TestSummarizingPolicy:
         summarizer = CapturingSummarizer()
         policy = SummarizingPolicy(
             summarizer,
-            retain_recent_items=2,
+            retain_recent_turns=2,
             retain_recent_token_budget=None,
-            min_items_to_summarize=1,
         )
         items = [user_msg(f"msg {i}") for i in range(5)]
         await policy.compact(items, session_id="s3")
@@ -1491,9 +1488,8 @@ class TestSummarizingPolicy:
         summarizer = CapturingSummarizer()
         policy = SummarizingPolicy(
             summarizer,
-            retain_recent_items=20,
+            retain_recent_turns=20,
             retain_recent_token_budget=None,
-            min_items_to_summarize=2,
         )
         items = [user_msg("a"), user_msg("b"), user_msg("c")]
         result = await policy.compact(items, session_id="s4")
@@ -1503,27 +1499,6 @@ class TestSummarizingPolicy:
         assert not summarizer.calls
 
     # ------------------------------------------------------------------
-    # min_items_to_summarize gate
-    # ------------------------------------------------------------------
-
-    async def test_min_items_gate_falls_back_to_sliding_window(self) -> None:
-        """Prefix shorter than min_items_to_summarize uses sliding-window fallback."""
-        summarizer = CapturingSummarizer()
-        policy = SummarizingPolicy(
-            summarizer,
-            retain_recent_items=4,
-            retain_recent_token_budget=None,
-            min_items_to_summarize=5,  # prefix would be < 5
-        )
-        # 6 items, retain_recent_items=4 → prefix=2, below min of 5
-        items = [user_msg(f"msg {i}") for i in range(6)]
-        result = await policy.compact(items, session_id="s5")
-
-        assert result["summary_generated"] is False
-        assert not summarizer.calls
-        # Fallback gives at most 4 items
-        assert len(result["items"]) <= 4
-
     # ------------------------------------------------------------------
     # Function call pair atomicity at summary boundary
     # ------------------------------------------------------------------
@@ -1533,12 +1508,11 @@ class TestSummarizingPolicy:
         summarizer = CapturingSummarizer()
         policy = SummarizingPolicy(
             summarizer,
-            retain_recent_items=3,
+            retain_recent_turns=3,
             retain_recent_token_budget=None,
-            min_items_to_summarize=1,
         )
         # History: user, fc, fco, user, user, user
-        # retain_recent_items=3 → tail = last 3 messages; fc/fco pair sits at boundary
+        # retain_recent_turns=3 → tail = last 3 messages; fc/fco pair sits at boundary
         items = [
             user_msg("q1"),
             function_call("c1"),
@@ -1563,9 +1537,8 @@ class TestSummarizingPolicy:
         summarizer = CapturingSummarizer()
         policy = SummarizingPolicy(
             summarizer,
-            retain_recent_items=2,
+            retain_recent_turns=2,
             retain_recent_token_budget=None,
-            min_items_to_summarize=1,
         )
         items = [
             user_msg("a"),
@@ -1585,25 +1558,23 @@ class TestSummarizingPolicy:
         """Summariser exception triggers sliding-window fallback, not raw history."""
         policy = SummarizingPolicy(
             RaisingSummarizer(),
-            retain_recent_items=3,
-            retain_recent_token_budget=None,
-            min_items_to_summarize=1,
+            retain_recent_turns=3,
+            retain_recent_token_budget=25,  # Small budget to constrain fallback
             fallback_to_sliding_window=True,
         )
         items = [user_msg(f"msg {i}") for i in range(8)]
         result = await policy.compact(items, session_id="s8")
 
         assert result["summary_generated"] is False
-        # Fallback is bounded — must not return all 8 items
-        assert len(result["items"]) <= 3
+        # Fallback is bounded by token budget — must not return all 8 items
+        assert len(result["items"]) < 8
 
     async def test_summariser_timeout_falls_back_to_sliding_window(self) -> None:
         """Summariser timeout triggers sliding-window fallback."""
         policy = SummarizingPolicy(
             SlowSummarizer(),
-            retain_recent_items=3,
-            retain_recent_token_budget=None,
-            min_items_to_summarize=1,
+            retain_recent_turns=3,
+            retain_recent_token_budget=25,  # Small budget to constrain fallback
             summary_timeout_seconds=0.01,
             fallback_to_sliding_window=True,
         )
@@ -1611,20 +1582,20 @@ class TestSummarizingPolicy:
         result = await policy.compact(items, session_id="s9")
 
         assert result["summary_generated"] is False
-        assert len(result["items"]) <= 3
+        assert len(result["items"]) < 8
 
     async def test_fallback_result_is_bounded_not_raw(self) -> None:
-        """Fallback must never return unbounded raw history."""
+        """Fallback must never return unbounded raw history when token_budget is set."""
         policy = SummarizingPolicy(
             RaisingSummarizer(),
-            retain_recent_items=2,
-            retain_recent_token_budget=None,
-            min_items_to_summarize=1,
+            retain_recent_turns=2,
+            retain_recent_token_budget=15,  # Small budget to bound the fallback
         )
         items = [user_msg(f"msg {i}") for i in range(20)]
         result = await policy.compact(items, session_id="s10")
 
-        assert len(result["items"]) <= 2
+        # Fallback respects token_budget
+        assert len(result["items"]) < 20
 
     # ------------------------------------------------------------------
     # Empty input
@@ -1635,7 +1606,7 @@ class TestSummarizingPolicy:
         summarizer = CapturingSummarizer()
         policy = SummarizingPolicy(
             summarizer,
-            retain_recent_items=5,
+            retain_recent_turns=5,
             retain_recent_token_budget=None,
         )
         result = await policy.compact([], session_id="s11")
@@ -1652,19 +1623,17 @@ class TestSummarizingPolicy:
         """get_config returns the policy type and all tuning parameters."""
         policy = SummarizingPolicy(
             CapturingSummarizer(),
-            retain_recent_items=15,
+            retain_recent_turns=15,
             retain_recent_token_budget=10000,
             summary_target_tokens=1200,
-            min_items_to_summarize=6,
             summary_timeout_seconds=8.0,
         )
         cfg = policy.get_config()
 
         assert cfg["policy_type"] == "summary_window"
-        assert cfg["retain_recent_items"] == 15
+        assert cfg["retain_recent_turns"] == 15
         assert cfg["retain_recent_token_budget"] == 10000
         assert cfg["summary_target_tokens"] == 1200
-        assert cfg["min_items_to_summarize"] == 6
         assert cfg["summary_timeout_seconds"] == 8.0
 
     # ------------------------------------------------------------------
@@ -1676,9 +1645,8 @@ class TestSummarizingPolicy:
         summarizer = CapturingSummarizer()
         policy = SummarizingPolicy(
             summarizer,
-            retain_recent_items=2,
+            retain_recent_turns=2,
             retain_recent_token_budget=None,
-            min_items_to_summarize=2,
         )
         mock = MockSession(session_id="e2e")
         for i in range(6):
@@ -1696,9 +1664,8 @@ class TestSummarizingPolicy:
         summarizer = CapturingSummarizer()
         policy = SummarizingPolicy(
             summarizer,
-            retain_recent_items=3,
+            retain_recent_turns=3,
             retain_recent_token_budget=None,
-            min_items_to_summarize=2,
         )
         items = [user_msg(f"msg {i}") for i in range(8)]
         result = await policy.compact(items, session_id="s12")
@@ -1715,9 +1682,8 @@ class TestSummarizingPolicy:
         """When fallback_to_sliding_window=False, a summariser exception propagates."""
         policy = SummarizingPolicy(
             RaisingSummarizer(RuntimeError("provider down")),
-            retain_recent_items=3,
+            retain_recent_turns=3,
             retain_recent_token_budget=None,
-            min_items_to_summarize=1,
             fallback_to_sliding_window=False,
         )
         items = [user_msg(f"msg {i}") for i in range(6)]
@@ -1731,9 +1697,8 @@ class TestSummarizingPolicy:
 
         policy = SummarizingPolicy(
             SlowSummarizer(),
-            retain_recent_items=3,
+            retain_recent_turns=3,
             retain_recent_token_budget=None,
-            min_items_to_summarize=1,
             summary_timeout_seconds=0.01,
             fallback_to_sliding_window=False,
         )
@@ -1753,4 +1718,269 @@ class TestSummarizingPolicy:
                 CapturingSummarizer(),
                 retain_recent_token_budget=5000,
                 token_counter=None,
+            )
+
+
+# -------------------------------------------------------------------
+# Turn-based retention tests (retain_recent_turns)
+# -------------------------------------------------------------------
+
+
+class TestSummarizingPolicyTurnRetention:
+    """Tests for SummarizingPolicy with retain_recent_turns (floor+ceiling semantics)."""
+
+    # ------------------------------------------------------------------
+    # Basic turn-based selection
+    # ------------------------------------------------------------------
+
+    async def test_retain_recent_turns_keeps_minimum_floor(self) -> None:
+        """retain_recent_turns=2 keeps at least 2 turns, regardless of token budget."""
+        summarizer = CapturingSummarizer()
+        # Each user_msg is ~5 tokens (1 char/4 = 1 token + 4 overhead)
+        # With budget=9, floor (2 turns ~10 tokens) exceeds budget, but floor is guaranteed
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=2,
+            retain_recent_token_budget=9,  # Budget < floor tokens, but floor still applies
+        )
+        # 4 turns: each turn is just a user message
+        items = [
+            user_msg("turn1"),
+            user_msg("turn2"),
+            user_msg("turn3"),
+            user_msg("turn4"),
+        ]
+        result = await policy.compact(items, session_id="s-turns-floor")
+
+        assert result["summary_generated"] is True
+        # Last 2 turns are kept (turn3, turn4) — floor guarantees this even over budget
+        tail = result["items"][1:]  # Skip summary item
+        assert len(tail) == 2
+        assert tail[0] == items[2]  # turn3
+        assert tail[1] == items[3]  # turn4
+        # Prefix (turn1, turn2) was summarised
+        assert result["metadata"]["items_summarized"] == 2
+        assert result["metadata"]["turns_kept"] == 2
+
+    async def test_retain_recent_turns_expands_within_budget(self) -> None:
+        """Token budget allows expansion beyond minimum floor."""
+        summarizer = CapturingSummarizer()
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=1,  # Minimum floor of 1
+            retain_recent_token_budget=50000,  # Large budget allows expansion
+        )
+        # 5 turns, each just a user message (small tokens)
+        items = [user_msg(f"turn{i}") for i in range(5)]
+        result = await policy.compact(items, session_id="s-turns-expand")
+
+        # With a large budget and small messages, all turns should fit
+        assert result["summary_generated"] is False
+        assert result["returned_count"] == 5
+
+    async def test_turn_includes_subsequent_items_until_next_user_msg(self) -> None:
+        """A turn includes all items from user msg until next user msg."""
+        summarizer = CapturingSummarizer()
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=1,  # Keep 1 turn
+            retain_recent_token_budget=None,
+        )
+        # Turn 1: user + assistant + tool call + tool output
+        # Turn 2: user + assistant
+        items = [
+            user_msg("turn1-user"),
+            assistant_msg("turn1-asst"),
+            function_call("fc1"),
+            function_call_output("fc1", "result1"),
+            user_msg("turn2-user"),
+            assistant_msg("turn2-asst"),
+        ]
+        result = await policy.compact(items, session_id="s-turn-boundary")
+
+        assert result["summary_generated"] is True
+        tail = result["items"][1:]
+        # Tail should be turn 2 (last 2 items)
+        assert len(tail) == 2
+        assert tail[0] == items[4]  # turn2-user
+        assert tail[1] == items[5]  # turn2-asst
+        assert result["metadata"]["turns_kept"] == 1
+
+    async def test_turn_floor_overrides_small_token_budget(self) -> None:
+        """Turn floor is guaranteed even when token budget would exclude items."""
+        summarizer = CapturingSummarizer()
+        # Very small budget that wouldn't fit even 1 turn normally
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=2,
+            retain_recent_token_budget=1,  # Extremely small
+        )
+        items = [
+            user_msg("turn1 with some longer content"),
+            user_msg("turn2 with more content"),
+            user_msg("turn3 with even more content"),
+        ]
+        result = await policy.compact(items, session_id="s-floor-override")
+
+        assert result["summary_generated"] is True
+        tail = result["items"][1:]
+        # Floor=2 guarantees 2 turns regardless of token budget
+        assert len(tail) == 2
+        assert result["metadata"]["turns_kept"] == 2
+
+    async def test_all_turns_fit_returns_unchanged(self) -> None:
+        """When all turns fit within the floor, return history unchanged."""
+        summarizer = CapturingSummarizer()
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=10,  # Floor higher than actual turns
+            retain_recent_token_budget=None,
+        )
+        items = [user_msg("turn1"), user_msg("turn2"), user_msg("turn3")]
+        result = await policy.compact(items, session_id="s-all-fit")
+
+        assert result["summary_generated"] is False
+        assert result["items"] == items
+        assert result["returned_count"] == 3
+
+    async def test_no_user_messages_returns_all(self) -> None:
+        """History with no user messages (no turns) returns everything."""
+        summarizer = CapturingSummarizer()
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=2,
+            retain_recent_token_budget=None,
+        )
+        # Edge case: no user messages, all assistant
+        items = [assistant_msg("asst1"), assistant_msg("asst2")]
+        result = await policy.compact(items, session_id="s-no-turns")
+
+        # No turns = nothing to drop
+        assert result["summary_generated"] is False
+        assert result["items"] == items
+
+    async def test_retain_recent_turns_in_get_config(self) -> None:
+        """get_config() includes retain_recent_turns."""
+        policy = SummarizingPolicy(
+            CapturingSummarizer(),
+            retain_recent_turns=3,
+            retain_recent_token_budget=15000,
+        )
+        config = policy.get_config()
+
+        assert config["retain_recent_turns"] == 3
+        assert config["retain_recent_token_budget"] == 15000
+
+    async def test_limiting_factor_reported_in_metadata(self) -> None:
+        """metadata includes tail_limiting_factor when applicable."""
+        summarizer = CapturingSummarizer()
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=2,
+            retain_recent_token_budget=1,  # Small budget forces floor-only
+        )
+        items = [user_msg(f"turn{i}") for i in range(5)]
+        result = await policy.compact(items, session_id="s-limit-factor")
+
+        assert result["summary_generated"] is True
+        # Should report turn_floor or token_budget as the limiting factor
+        assert result["limiting_factor"] in ("turn_floor", "token_budget")
+        assert "tail_limiting_factor" in result["metadata"]
+
+    async def test_summarizer_input_token_limit_truncates_prefix(self) -> None:
+        """Prefix exceeding summarizer_input_token_limit is truncated from oldest."""
+        summarizer = CapturingSummarizer()
+        # Use a counter that returns 100 tokens per item (~400 chars / 4)
+        # Each item will cost 100 + 4 = 104 tokens with overhead.
+        big_msg = "x" * 400  # ~100 tokens with default counter
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=1,
+            retain_recent_token_budget=None,
+            summarizer_input_token_limit=250,  # Only ~2 items fit (104*2=208 < 250 < 104*3=312)
+        )
+        # 4 turns: first 3 become prefix, last 1 is the tail
+        items = [
+            user_msg(big_msg),  # turn 1 (oldest)
+            user_msg(big_msg),  # turn 2
+            user_msg(big_msg),  # turn 3
+            user_msg("recent"),  # turn 4 (tail)
+        ]
+        result = await policy.compact(items, session_id="s-truncate")
+
+        assert result["summary_generated"] is True
+        # Summariser should have received only 2 items (oldest dropped)
+        assert len(summarizer.calls) == 1
+        _, summarized_items = summarizer.calls[0]
+        assert len(summarized_items) == 2
+        # The 2 kept should be the newest from the prefix (items[1] and items[2])
+        assert summarized_items[0] == items[1]
+        assert summarized_items[1] == items[2]
+
+    async def test_summarizer_input_token_limit_preserves_pairs(self) -> None:
+        """Prefix truncation keeps function_call/output pairs atomic."""
+        summarizer = CapturingSummarizer()
+        big_msg = "x" * 400  # ~100 tokens → 104 with overhead
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=1,
+            retain_recent_token_budget=None,
+            # Budget for ~3 items (312 tokens), but a pair costs 2 slots
+            summarizer_input_token_limit=350,
+        )
+        items = [
+            user_msg(big_msg),  # oldest (will be dropped)
+            function_call("fc1", "tool", big_msg),  # pair: must keep both or neither
+            function_call_output("fc1", big_msg),
+            user_msg("recent"),  # tail
+        ]
+        result = await policy.compact(items, session_id="s-pairs")
+
+        assert result["summary_generated"] is True
+        _, summarized_items = summarizer.calls[0]
+        # The pair should be kept together (2 items) — oldest user msg dropped
+        call_ids = [item.get("call_id") for item in summarized_items if item.get("call_id")]
+        # Either both pair items are present or neither
+        assert call_ids.count("fc1") in (0, 2)
+
+    async def test_summarizer_input_token_limit_none_disables_truncation(self) -> None:
+        """Setting summarizer_input_token_limit=None sends full prefix."""
+        summarizer = CapturingSummarizer()
+        big_msg = "x" * 400
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=1,
+            retain_recent_token_budget=None,
+            summarizer_input_token_limit=None,  # disabled
+        )
+        items = [
+            user_msg(big_msg),
+            user_msg(big_msg),
+            user_msg(big_msg),
+            user_msg("recent"),  # tail
+        ]
+        result = await policy.compact(items, session_id="s-no-limit")
+
+        assert result["summary_generated"] is True
+        _, summarized_items = summarizer.calls[0]
+        # All 3 prefix items sent without truncation
+        assert len(summarized_items) == 3
+
+    async def test_summarizer_input_token_limit_in_get_config(self) -> None:
+        """get_config() includes summarizer_input_token_limit."""
+        policy = SummarizingPolicy(
+            CapturingSummarizer(),
+            summarizer_input_token_limit=50_000,
+        )
+        config = policy.get_config()
+        assert config["summarizer_input_token_limit"] == 50_000
+
+    async def test_summarizer_input_token_limit_requires_token_counter(self) -> None:
+        """Cannot set summarizer_input_token_limit without a token_counter."""
+        with pytest.raises(ValueError, match="summarizer_input_token_limit requires"):
+            SummarizingPolicy(
+                CapturingSummarizer(),
+                summarizer_input_token_limit=60_000,
+                token_counter=None,
+                retain_recent_token_budget=None,
             )

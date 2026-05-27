@@ -175,10 +175,10 @@ class MyOpenAISummarizer:
 
 policy = SummarizingPolicy(
     MyOpenAISummarizer(),
-    retain_recent_items=20,            # keep last 20 items raw
-    retain_recent_token_budget=20000,   # or stop at 20k tokens
+    retain_recent_turns=2,              # keep at least 2 recent turns raw (floor)
+    retain_recent_token_budget=20000,   # expand tail up to 20k tokens (ceiling)
     summary_target_tokens=1500,         # hint for summary length
-    min_items_to_summarize=8,           # skip summarisation for short prefixes
+    summarizer_input_token_limit=60000, # truncate prefix before sending to summariser
     summary_timeout_seconds=5.0,        # cancel if summariser is too slow
 )
 
@@ -187,9 +187,10 @@ session = LocalCompactionSession(underlying, policy=policy)
 
 When `get_items()` is called, the policy:
 
-1. Computes a boundary-aware tail (respecting function-call-pair atomicity)
-2. Sends the older prefix to the summariser
-3. Returns `[summary_item] + recent_tail`
+1. Selects a recent tail using turn-aware retention (floor + ceiling: at least N turns, expand if token budget allows)
+2. Truncates the older prefix to `summarizer_input_token_limit` tokens (dropping oldest items first, preserving pair atomicity)
+3. Sends the prefix to the summariser
+4. Returns `[summary_item] + recent_tail`
 
 If the summariser raises or times out, the policy falls back to `SlidingWindowPolicy` with the same tail budget (set `fallback_to_sliding_window=False` to propagate the exception instead).
 
@@ -208,7 +209,7 @@ See `CompactionPolicy` and `CompactionResult` in the [Future Considerations](#fu
 For very large sessions (thousands of items), compaction runs on every `get_items()` call. No in-process cache is kept — each call fetches from the underlying session to avoid stale reads when the session is backed by a shared database with concurrent writers. The compaction algorithm itself is O(n) where n is the total session size. If performance becomes a concern:
 
 - Consider periodic session pruning at the storage layer
-- Use a reasonable `window_size` or `retain_recent_items` that balances context retention with processing cost
+- Use a reasonable `window_size` or `retain_recent_turns` that balances context retention with processing cost
 
 ---
 
