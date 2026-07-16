@@ -6,14 +6,24 @@ Enables automatic context compaction when conversation history grows too large.
 
 from openai_agents_context_compaction._version import __version__
 from openai_agents_context_compaction.session import (
+    CompactionPolicy,
+    CompactionResult,
     DefaultTokenCounter,
+    HistorySummarizer,
     LocalCompactionSession,
+    SlidingWindowPolicy,
+    SummarizingPolicy,
     TiktokenCounter,
 )
 
 __all__ = [
     "__version__",
+    "CompactionPolicy",
+    "CompactionResult",
     "DefaultTokenCounter",
+    "HistorySummarizer",
     "LocalCompactionSession",
+    "SlidingWindowPolicy",
+    "SummarizingPolicy",
     "TiktokenCounter",
 ]
