@@ -45,3 +45,6 @@ nosetests.xml
 coverage.xml
 *.cover
 PLAN*.md
+
+# IDEs
+.idea/

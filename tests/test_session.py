@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import logging
+from typing import cast
 
 import pytest
 from agents import Session, TResponseInputItem
 
-from openai_agents_context_compaction import LocalCompactionSession
+from openai_agents_context_compaction import (
+    CompactionResult,
+    LocalCompactionSession,
+    SummarizingPolicy,
+)
 from openai_agents_context_compaction.session import (
     _count_tokens,
     _determine_limiting_factor,
@@ -40,31 +45,78 @@ class MockSession(Session):
         self._items.clear()
 
 
+class RecordingPolicy:
+    """Test policy used to verify LocalCompactionSession delegation."""
+
+    def __init__(self, returned_items: list[TResponseInputItem]) -> None:
+        self._returned_items = list(returned_items)
+        self.calls: list[tuple[str, int | None, list[TResponseInputItem]]] = []
+
+    async def compact(
+        self,
+        items: list[TResponseInputItem],
+        *,
+        session_id: str,
+        limit: int | None = None,
+    ) -> CompactionResult:
+        self.calls.append((session_id, limit, list(items)))
+        return {
+            "items": list(self._returned_items),
+            "original_count": len(items),
+            "returned_count": len(self._returned_items),
+            "limiting_factor": "recording_policy",
+            "summary_generated": False,
+            "metadata": {"policy_type": "recording"},
+        }
+
+    def get_config(self) -> dict[str, object]:
+        return {
+            "policy_type": "recording",
+            "window_size": None,
+            "token_budget": None,
+            "token_counter_type": None,
+        }
+
+
 # -------------------------------------------------------------------
 # Helpers
 # -------------------------------------------------------------------
 
 
 def user_msg(content: str) -> TResponseInputItem:
-    return {"role": "user", "content": content}
+    return cast(TResponseInputItem, {"role": "user", "content": content})
 
 
 def assistant_msg(content: str) -> TResponseInputItem:
-    return {
-        "role": "assistant",
-        "type": "message",
-        "content": [{"text": content, "type": "output_text"}],
-    }
+    return cast(
+        TResponseInputItem,
+        {
+            "role": "assistant",
+            "type": "message",
+            "content": [{"text": content, "type": "output_text"}],
+        },
+    )
 
 
 def function_call(
     call_id: str, name: str = "test_func", arguments: str = "{}"
 ) -> TResponseInputItem:
-    return {"type": "function_call", "call_id": call_id, "name": name, "arguments": arguments}
+    return cast(
+        TResponseInputItem,
+        {
+            "type": "function_call",
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments,
+        },
+    )
 
 
 def function_call_output(call_id: str, output: str = "result") -> TResponseInputItem:
-    return {"type": "function_call_output", "call_id": call_id, "output": output}
+    return cast(
+        TResponseInputItem,
+        {"type": "function_call_output", "call_id": call_id, "output": output},
+    )
 
 
 def _validate_invariants(items: list[TResponseInputItem]) -> None:
@@ -72,8 +124,10 @@ def _validate_invariants(items: list[TResponseInputItem]) -> None:
 
     Every function_call must have a matching output and vice versa.
     """
-    calls = {i["call_id"] for i in items if i.get("type") == "function_call"}
-    outputs = {i["call_id"] for i in items if i.get("type") == "function_call_output"}
+    calls = {cast(str, i.get("call_id")) for i in items if i.get("type") == "function_call"}
+    outputs = {
+        cast(str, i.get("call_id")) for i in items if i.get("type") == "function_call_output"
+    }
     assert calls <= outputs, f"Orphaned function_call(s): {calls - outputs}"
     assert outputs <= calls, f"Orphaned function_call_output(s): {outputs - calls}"
 
@@ -106,7 +160,7 @@ class TestLocalCompactionSession:
         _validate_invariants(items)
         for i in items:
             if i.get("role"):
-                assert i["role"] in ("user", "assistant", "system")
+                assert i.get("role") in ("user", "assistant", "system")
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("window_size", [None, 0, 1, 2, 5])
@@ -203,7 +257,7 @@ class TestLocalCompactionSession:
         self._validate_invariants(items)
         # Only valid user message remains
         assert len(items) == 1
-        assert items[0]["content"] == "msg"
+        assert items[0].get("content") == "msg"
 
     @pytest.mark.asyncio
     async def test_limit_and_window_interaction(self) -> None:
@@ -300,7 +354,7 @@ class TestLocalCompactionSession:
         await mock.add_items([user_msg(f"msg{i}") for i in range(5)])
         compacting = LocalCompactionSession(mock, window_size=None)
         items = await compacting.get_items(limit=3)
-        assert [i["content"] for i in items] == ["msg2", "msg3", "msg4"]
+        assert [i.get("content") for i in items] == ["msg2", "msg3", "msg4"]
 
     @pytest.mark.asyncio
     async def test_delegation_methods(self) -> None:
@@ -347,7 +401,10 @@ class TestLocalCompactionSession:
         message doesn't mask a regression in the behavioural assertion here.
         """
         mock = MockSession()
-        unknown_item = {"type": "future_reasoning_item", "content": "thinking..."}
+        unknown_item = cast(
+            TResponseInputItem,
+            {"type": "future_reasoning_item", "content": "thinking..."},
+        )
         valid_msg = user_msg("valid message")
         await mock.add_items([user_msg("older"), unknown_item, valid_msg])
         compacting = LocalCompactionSession(mock, window_size=2)
@@ -367,7 +424,10 @@ class TestLocalCompactionSession:
         operators see this in production without enabling debug logging.
         """
         mock = MockSession()
-        unknown_item = {"type": "future_reasoning_item", "content": "thinking..."}
+        unknown_item = cast(
+            TResponseInputItem,
+            {"type": "future_reasoning_item", "content": "thinking..."},
+        )
         await mock.add_items([user_msg("older"), unknown_item, user_msg("valid message")])
         compacting = LocalCompactionSession(mock, window_size=2)
 
@@ -914,7 +974,9 @@ class TestTokenBudgetCompaction:
         assert items[0] == user_msg("msg4")
 
     @pytest.mark.asyncio
-    async def test_interleaved_message_between_pair_dropped_by_token_budget(self) -> None:
+    async def test_interleaved_message_between_pair_dropped_by_token_budget(
+        self,
+    ) -> None:
         """A message interleaved between fc and fco is independently token-budget-accounted.
 
         mid_msg sits between fc and fco in the list, but is NOT treated as part of the pair.
@@ -1159,6 +1221,7 @@ class TestObservability:
         config = compacting.get_compaction_config()
         assert config == {
             "session_id": "cfg-test",
+            "policy_type": "sliding_window",
             "window_size": 10,
             "token_budget": 5000,
             "token_counter_type": "function",  # plain functions report type.__name__ == "function"
@@ -1177,3 +1240,747 @@ class TestObservability:
             LocalCompactionSession(mock).get_compaction_config()["token_counter_type"]
             == "DefaultTokenCounter"
         )
+
+    def test_get_compaction_config_uses_explicit_policy(self) -> None:
+        """Explicit policy config is surfaced instead of the legacy sliding-window keys."""
+        mock = MockSession(session_id="policy-test")
+        policy = RecordingPolicy([])
+
+        config = LocalCompactionSession(mock, window_size=1, policy=policy).get_compaction_config()
+
+        assert config == {
+            "session_id": "policy-test",
+            "policy_type": "recording",
+            "window_size": None,
+            "token_budget": None,
+            "token_counter_type": None,
+        }
+
+
+class TestPolicyDelegation:
+    """Tests for the new explicit policy path on LocalCompactionSession."""
+
+    @pytest.mark.asyncio
+    async def test_explicit_policy_overrides_legacy_window_and_limit(self) -> None:
+        """When policy= is provided, the wrapper delegates selection to that policy."""
+        mock = MockSession(session_id="policy-session")
+        all_items = [user_msg("older"), user_msg("newer"), user_msg("newest")]
+        await mock.add_items(all_items)
+        policy = RecordingPolicy(all_items[:2])
+
+        compacting = LocalCompactionSession(mock, window_size=1, policy=policy)
+        items = await compacting.get_items(limit=1)
+
+        assert items == all_items[:2]
+        assert policy.calls == [("policy-session", 1, all_items)]
+
+    @pytest.mark.asyncio
+    async def test_policy_exception_propagates(self) -> None:
+        """When the active policy raises, the exception propagates to the caller."""
+
+        class FailingPolicy:
+            async def compact(
+                self,
+                items: list[TResponseInputItem],
+                *,
+                session_id: str,
+                limit: int | None = None,
+            ) -> CompactionResult:
+                raise RuntimeError("summariser unavailable")
+
+            def get_config(self) -> dict[str, object]:
+                return {"policy_type": "failing"}
+
+        mock = MockSession(session_id="fail-session")
+        await mock.add_items([user_msg("hi")])
+        compacting = LocalCompactionSession(mock, policy=FailingPolicy())
+
+        with pytest.raises(RuntimeError, match="summariser unavailable"):
+            await compacting.get_items()
+
+    def test_repr_without_window_or_budget_keys(self) -> None:
+        """Repr is safe when the policy config omits window_size/token_budget."""
+
+        class MinimalPolicy:
+            async def compact(
+                self,
+                items: list[TResponseInputItem],
+                *,
+                session_id: str,
+                limit: int | None = None,
+            ) -> CompactionResult:
+                return {
+                    "items": list(items),
+                    "original_count": len(items),
+                    "returned_count": len(items),
+                    "limiting_factor": None,
+                    "summary_generated": False,
+                    "metadata": {},
+                }
+
+            def get_config(self) -> dict[str, object]:
+                return {"policy_type": "minimal"}
+
+        mock = MockSession(session_id="repr-test")
+        compacting = LocalCompactionSession(mock, policy=MinimalPolicy())
+        r = repr(compacting)
+        assert "repr-test" in r
+        assert "minimal" in r
+        assert "window_size" not in r
+        assert "token_budget" not in r
+
+    def test_warns_on_legacy_args_with_explicit_policy(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A warning is emitted when policy= is supplied alongside legacy arguments."""
+        mock = MockSession(session_id="warn-test")
+        policy = RecordingPolicy([])
+
+        with caplog.at_level(logging.WARNING):
+            LocalCompactionSession(mock, window_size=5, token_budget=1000, policy=policy)
+
+        assert any(
+            "ignoring legacy arguments" in r.message and "window_size=5" in r.message
+            for r in caplog.records
+        )
+
+    def test_no_warning_when_only_policy_provided(self, caplog: pytest.LogCaptureFixture) -> None:
+        """No spurious warning when policy= is the only argument supplied."""
+        mock = MockSession(session_id="no-warn-test")
+        policy = RecordingPolicy([])
+
+        with caplog.at_level(logging.WARNING):
+            LocalCompactionSession(mock, policy=policy)
+
+        assert not any("ignoring legacy arguments" in r.message for r in caplog.records)
+
+
+# -------------------------------------------------------------------
+# SummarizingPolicy tests
+# -------------------------------------------------------------------
+
+
+class CapturingSummarizer:
+    """Test summarizer that records calls and returns a fixed summary item."""
+
+    def __init__(self, summary_text: str = "Summary of earlier context") -> None:
+        self.calls: list[tuple[str, list[TResponseInputItem]]] = []
+        self._summary_text = summary_text
+
+    async def summarize(
+        self,
+        items: list[TResponseInputItem],
+        *,
+        session_id: str,
+        target_tokens: int | None = None,
+        existing_summary: str | None = None,
+    ) -> TResponseInputItem:
+        self.calls.append((session_id, list(items)))
+        return cast(
+            TResponseInputItem,
+            {
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "output_text", "text": self._summary_text}],
+            },
+        )
+
+
+class RaisingSummarizer:
+    """Test summarizer that always raises."""
+
+    def __init__(self, exc: Exception | None = None) -> None:
+        self._exc = exc or RuntimeError("summariser failed")
+
+    async def summarize(
+        self,
+        items: list[TResponseInputItem],
+        *,
+        session_id: str,
+        target_tokens: int | None = None,
+        existing_summary: str | None = None,
+    ) -> TResponseInputItem:
+        raise self._exc
+
+
+class SlowSummarizer:
+    """Test summarizer that never returns (for timeout testing)."""
+
+    async def summarize(
+        self,
+        items: list[TResponseInputItem],
+        *,
+        session_id: str,
+        target_tokens: int | None = None,
+        existing_summary: str | None = None,
+    ) -> TResponseInputItem:
+        import asyncio
+
+        await asyncio.sleep(9999)
+        raise AssertionError("should not reach here")  # pragma: no cover
+
+
+class TestSummarizingPolicy:
+    """Tests for SummarizingPolicy."""
+
+    # ------------------------------------------------------------------
+    # Basic summarisation path
+    # ------------------------------------------------------------------
+
+    async def test_injects_summary_item_plus_tail(self) -> None:
+        """Long history: returns [summary_item] + recent_tail."""
+        summarizer = CapturingSummarizer()
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=3,
+            retain_recent_token_budget=None,
+        )
+        items = [user_msg(f"msg {i}") for i in range(8)]
+        result = await policy.compact(items, session_id="s1")
+
+        assert result["summary_generated"] is True
+        # First item is the synthetic summary
+        assert result["items"][0]["role"] == "assistant"
+        assert "Summary" in str(result["items"][0]["content"])
+        # Remaining items are the raw tail (3 most recent)
+        tail = result["items"][1:]
+        assert len(tail) == 3
+        assert tail == items[-3:]
+        assert result["original_count"] == 8
+        assert result["returned_count"] == 4  # 1 summary + 3 tail
+
+    async def test_summary_item_is_first(self) -> None:
+        """Summary item must always be at index 0."""
+        summarizer = CapturingSummarizer()
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=2,
+            retain_recent_token_budget=None,
+        )
+        items = [user_msg("a"), user_msg("b"), user_msg("c"), user_msg("d")]
+        result = await policy.compact(items, session_id="s2")
+
+        assert result["summary_generated"] is True
+        assert result["items"][0]["role"] == "assistant"
+
+    async def test_summariser_receives_prefix_not_tail(self) -> None:
+        """The summariser only receives the items NOT in the raw tail."""
+        summarizer = CapturingSummarizer()
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=2,
+            retain_recent_token_budget=None,
+        )
+        items = [user_msg(f"msg {i}") for i in range(5)]
+        await policy.compact(items, session_id="s3")
+
+        assert len(summarizer.calls) == 1
+        _, summarized_items = summarizer.calls[0]
+        # Prefix = first 3 items; tail = last 2
+        assert summarized_items == items[:3]
+
+    # ------------------------------------------------------------------
+    # Nothing-to-summarize gate
+    # ------------------------------------------------------------------
+
+    async def test_no_summarisation_when_history_fits(self) -> None:
+        """History that fits within the budget is returned unchanged."""
+        summarizer = CapturingSummarizer()
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=20,
+            retain_recent_token_budget=None,
+        )
+        items = [user_msg("a"), user_msg("b"), user_msg("c")]
+        result = await policy.compact(items, session_id="s4")
+
+        assert result["summary_generated"] is False
+        assert result["items"] == items
+        assert not summarizer.calls
+
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Function call pair atomicity at summary boundary
+    # ------------------------------------------------------------------
+
+    async def test_function_call_pair_not_split_at_boundary(self) -> None:
+        """A function_call/function_call_output pair is never split across the boundary."""
+        summarizer = CapturingSummarizer()
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=3,
+            retain_recent_token_budget=None,
+        )
+        # History: user, fc, fco, user, user, user
+        # retain_recent_turns=3 → tail = last 3 messages; fc/fco pair sits at boundary
+        items = [
+            user_msg("q1"),
+            function_call("c1"),
+            function_call_output("c1"),
+            user_msg("q2"),
+            user_msg("q3"),
+            user_msg("q4"),
+        ]
+        result = await policy.compact(items, session_id="s6")
+
+        _validate_invariants(result["items"])
+        # fc/fco pair atomicity: both in prefix or both in tail
+        tail = result["items"][1:]  # exclude summary item
+        call_ids_in_tail = {cast(str, i.get("call_id")) for i in tail if i.get("call_id")}
+        prefix_items = summarizer.calls[0][1] if summarizer.calls else []
+        call_ids_in_prefix = {cast(str, i.get("call_id")) for i in prefix_items if i.get("call_id")}
+        # No call_id should appear in both prefix and tail
+        assert call_ids_in_tail.isdisjoint(call_ids_in_prefix)
+
+    async def test_result_passes_orphan_validator(self) -> None:
+        """Final result must always pass function-call-pair validation."""
+        summarizer = CapturingSummarizer()
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=2,
+            retain_recent_token_budget=None,
+        )
+        items = [
+            user_msg("a"),
+            function_call("c1"),
+            function_call_output("c1"),
+            user_msg("b"),
+            user_msg("c"),
+        ]
+        result = await policy.compact(items, session_id="s7")
+        _validate_invariants(result["items"])
+
+    # ------------------------------------------------------------------
+    # Failure fallback
+    # ------------------------------------------------------------------
+
+    async def test_summariser_exception_falls_back_to_sliding_window(self) -> None:
+        """Summariser exception triggers sliding-window fallback, not raw history."""
+        policy = SummarizingPolicy(
+            RaisingSummarizer(),
+            retain_recent_turns=3,
+            retain_recent_token_budget=25,  # Small budget to constrain fallback
+            fallback_to_sliding_window=True,
+        )
+        items = [user_msg(f"msg {i}") for i in range(8)]
+        result = await policy.compact(items, session_id="s8")
+
+        assert result["summary_generated"] is False
+        # Fallback is bounded by token budget — must not return all 8 items
+        assert len(result["items"]) < 8
+
+    async def test_summariser_timeout_falls_back_to_sliding_window(self) -> None:
+        """Summariser timeout triggers sliding-window fallback."""
+        policy = SummarizingPolicy(
+            SlowSummarizer(),
+            retain_recent_turns=3,
+            retain_recent_token_budget=25,  # Small budget to constrain fallback
+            summary_timeout_seconds=0.01,
+            fallback_to_sliding_window=True,
+        )
+        items = [user_msg(f"msg {i}") for i in range(8)]
+        result = await policy.compact(items, session_id="s9")
+
+        assert result["summary_generated"] is False
+        assert len(result["items"]) < 8
+
+    async def test_fallback_result_is_bounded_not_raw(self) -> None:
+        """Fallback must never return unbounded raw history when token_budget is set."""
+        policy = SummarizingPolicy(
+            RaisingSummarizer(),
+            retain_recent_turns=2,
+            retain_recent_token_budget=15,  # Small budget to bound the fallback
+        )
+        items = [user_msg(f"msg {i}") for i in range(20)]
+        result = await policy.compact(items, session_id="s10")
+
+        # Fallback respects token_budget
+        assert len(result["items"]) < 20
+
+    # ------------------------------------------------------------------
+    # Empty input
+    # ------------------------------------------------------------------
+
+    async def test_empty_items_returns_empty(self) -> None:
+        """Empty input returns empty result without calling the summariser."""
+        summarizer = CapturingSummarizer()
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=5,
+            retain_recent_token_budget=None,
+        )
+        result = await policy.compact([], session_id="s11")
+
+        assert result["items"] == []
+        assert result["original_count"] == 0
+        assert not summarizer.calls
+
+    # ------------------------------------------------------------------
+    # get_config
+    # ------------------------------------------------------------------
+
+    def test_get_config_exposes_policy_details(self) -> None:
+        """get_config returns the policy type and all tuning parameters."""
+        policy = SummarizingPolicy(
+            CapturingSummarizer(),
+            retain_recent_turns=15,
+            retain_recent_token_budget=10000,
+            summary_target_tokens=1200,
+            summary_timeout_seconds=8.0,
+        )
+        cfg = policy.get_config()
+
+        assert cfg["policy_type"] == "summary_window"
+        assert cfg["retain_recent_turns"] == 15
+        assert cfg["retain_recent_token_budget"] == 10000
+        assert cfg["summary_target_tokens"] == 1200
+        assert cfg["summary_timeout_seconds"] == 8.0
+
+    # ------------------------------------------------------------------
+    # LocalCompactionSession integration
+    # ------------------------------------------------------------------
+
+    async def test_via_local_compaction_session(self) -> None:
+        """SummarizingPolicy works end-to-end through LocalCompactionSession."""
+        summarizer = CapturingSummarizer()
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=2,
+            retain_recent_token_budget=None,
+        )
+        mock = MockSession(session_id="e2e")
+        for i in range(6):
+            await mock.add_items([user_msg(f"msg {i}")])
+
+        session = LocalCompactionSession(mock, policy=policy)
+        items = await session.get_items()
+
+        assert len(items) == 3  # 1 summary + 2 tail
+        assert items[0]["role"] == "assistant"
+        _validate_invariants(items)
+
+    async def test_metadata_summary_generated_flag(self) -> None:
+        """CompactionResult metadata reflects whether a summary was generated."""
+        summarizer = CapturingSummarizer()
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=3,
+            retain_recent_token_budget=None,
+        )
+        items = [user_msg(f"msg {i}") for i in range(8)]
+        result = await policy.compact(items, session_id="s12")
+
+        assert result["metadata"]["policy_type"] == "summary_window"
+        assert result["metadata"]["items_summarized"] == 5
+        assert result["metadata"]["tail_items_kept"] == 3
+
+    # ------------------------------------------------------------------
+    # fallback_to_sliding_window=False
+    # ------------------------------------------------------------------
+
+    async def test_fallback_false_propagates_exception(self) -> None:
+        """When fallback_to_sliding_window=False, a summariser exception propagates."""
+        policy = SummarizingPolicy(
+            RaisingSummarizer(RuntimeError("provider down")),
+            retain_recent_turns=3,
+            retain_recent_token_budget=None,
+            fallback_to_sliding_window=False,
+        )
+        items = [user_msg(f"msg {i}") for i in range(6)]
+
+        with pytest.raises(RuntimeError, match="provider down"):
+            await policy.compact(items, session_id="s-no-fallback")
+
+    async def test_fallback_false_propagates_timeout(self) -> None:
+        """When fallback_to_sliding_window=False, a timeout propagates as asyncio.TimeoutError."""
+        import asyncio
+
+        policy = SummarizingPolicy(
+            SlowSummarizer(),
+            retain_recent_turns=3,
+            retain_recent_token_budget=None,
+            summary_timeout_seconds=0.01,
+            fallback_to_sliding_window=False,
+        )
+        items = [user_msg(f"msg {i}") for i in range(6)]
+
+        with pytest.raises(asyncio.TimeoutError):
+            await policy.compact(items, session_id="s-no-fallback-timeout")
+
+    # ------------------------------------------------------------------
+    # __init__ validation
+    # ------------------------------------------------------------------
+
+    def test_raises_when_token_budget_without_counter(self) -> None:
+        """retain_recent_token_budget with token_counter=None raises ValueError at construction."""
+        with pytest.raises(ValueError, match="retain_recent_token_budget requires a token_counter"):
+            SummarizingPolicy(
+                CapturingSummarizer(),
+                retain_recent_token_budget=5000,
+                token_counter=None,
+            )
+
+
+# -------------------------------------------------------------------
+# Turn-based retention tests (retain_recent_turns)
+# -------------------------------------------------------------------
+
+
+class TestSummarizingPolicyTurnRetention:
+    """Tests for SummarizingPolicy with retain_recent_turns (floor+ceiling semantics)."""
+
+    # ------------------------------------------------------------------
+    # Basic turn-based selection
+    # ------------------------------------------------------------------
+
+    async def test_retain_recent_turns_keeps_minimum_floor(self) -> None:
+        """retain_recent_turns=2 keeps at least 2 turns, regardless of token budget."""
+        summarizer = CapturingSummarizer()
+        # Each user_msg is ~5 tokens (1 char/4 = 1 token + 4 overhead)
+        # With budget=9, floor (2 turns ~10 tokens) exceeds budget, but floor is guaranteed
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=2,
+            retain_recent_token_budget=9,  # Budget < floor tokens, but floor still applies
+        )
+        # 4 turns: each turn is just a user message
+        items = [
+            user_msg("turn1"),
+            user_msg("turn2"),
+            user_msg("turn3"),
+            user_msg("turn4"),
+        ]
+        result = await policy.compact(items, session_id="s-turns-floor")
+
+        assert result["summary_generated"] is True
+        # Last 2 turns are kept (turn3, turn4) — floor guarantees this even over budget
+        tail = result["items"][1:]  # Skip summary item
+        assert len(tail) == 2
+        assert tail[0] == items[2]  # turn3
+        assert tail[1] == items[3]  # turn4
+        # Prefix (turn1, turn2) was summarised
+        assert result["metadata"]["items_summarized"] == 2
+        assert result["metadata"]["turns_kept"] == 2
+
+    async def test_retain_recent_turns_expands_within_budget(self) -> None:
+        """Token budget allows expansion beyond minimum floor."""
+        summarizer = CapturingSummarizer()
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=1,  # Minimum floor of 1
+            retain_recent_token_budget=50000,  # Large budget allows expansion
+        )
+        # 5 turns, each just a user message (small tokens)
+        items = [user_msg(f"turn{i}") for i in range(5)]
+        result = await policy.compact(items, session_id="s-turns-expand")
+
+        # With a large budget and small messages, all turns should fit
+        assert result["summary_generated"] is False
+        assert result["returned_count"] == 5
+
+    async def test_turn_includes_subsequent_items_until_next_user_msg(self) -> None:
+        """A turn includes all items from user msg until next user msg."""
+        summarizer = CapturingSummarizer()
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=1,  # Keep 1 turn
+            retain_recent_token_budget=None,
+        )
+        # Turn 1: user + assistant + tool call + tool output
+        # Turn 2: user + assistant
+        items = [
+            user_msg("turn1-user"),
+            assistant_msg("turn1-asst"),
+            function_call("fc1"),
+            function_call_output("fc1", "result1"),
+            user_msg("turn2-user"),
+            assistant_msg("turn2-asst"),
+        ]
+        result = await policy.compact(items, session_id="s-turn-boundary")
+
+        assert result["summary_generated"] is True
+        tail = result["items"][1:]
+        # Tail should be turn 2 (last 2 items)
+        assert len(tail) == 2
+        assert tail[0] == items[4]  # turn2-user
+        assert tail[1] == items[5]  # turn2-asst
+        assert result["metadata"]["turns_kept"] == 1
+
+    async def test_turn_floor_overrides_small_token_budget(self) -> None:
+        """Turn floor is guaranteed even when token budget would exclude items."""
+        summarizer = CapturingSummarizer()
+        # Very small budget that wouldn't fit even 1 turn normally
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=2,
+            retain_recent_token_budget=1,  # Extremely small
+        )
+        items = [
+            user_msg("turn1 with some longer content"),
+            user_msg("turn2 with more content"),
+            user_msg("turn3 with even more content"),
+        ]
+        result = await policy.compact(items, session_id="s-floor-override")
+
+        assert result["summary_generated"] is True
+        tail = result["items"][1:]
+        # Floor=2 guarantees 2 turns regardless of token budget
+        assert len(tail) == 2
+        assert result["metadata"]["turns_kept"] == 2
+
+    async def test_all_turns_fit_returns_unchanged(self) -> None:
+        """When all turns fit within the floor, return history unchanged."""
+        summarizer = CapturingSummarizer()
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=10,  # Floor higher than actual turns
+            retain_recent_token_budget=None,
+        )
+        items = [user_msg("turn1"), user_msg("turn2"), user_msg("turn3")]
+        result = await policy.compact(items, session_id="s-all-fit")
+
+        assert result["summary_generated"] is False
+        assert result["items"] == items
+        assert result["returned_count"] == 3
+
+    async def test_no_user_messages_returns_all(self) -> None:
+        """History with no user messages (no turns) returns everything."""
+        summarizer = CapturingSummarizer()
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=2,
+            retain_recent_token_budget=None,
+        )
+        # Edge case: no user messages, all assistant
+        items = [assistant_msg("asst1"), assistant_msg("asst2")]
+        result = await policy.compact(items, session_id="s-no-turns")
+
+        # No turns = nothing to drop
+        assert result["summary_generated"] is False
+        assert result["items"] == items
+
+    async def test_retain_recent_turns_in_get_config(self) -> None:
+        """get_config() includes retain_recent_turns."""
+        policy = SummarizingPolicy(
+            CapturingSummarizer(),
+            retain_recent_turns=3,
+            retain_recent_token_budget=15000,
+        )
+        config = policy.get_config()
+
+        assert config["retain_recent_turns"] == 3
+        assert config["retain_recent_token_budget"] == 15000
+
+    async def test_limiting_factor_reported_in_metadata(self) -> None:
+        """metadata includes tail_limiting_factor when applicable."""
+        summarizer = CapturingSummarizer()
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=2,
+            retain_recent_token_budget=1,  # Small budget forces floor-only
+        )
+        items = [user_msg(f"turn{i}") for i in range(5)]
+        result = await policy.compact(items, session_id="s-limit-factor")
+
+        assert result["summary_generated"] is True
+        # Should report turn_floor or token_budget as the limiting factor
+        assert result["limiting_factor"] in ("turn_floor", "token_budget")
+        assert "tail_limiting_factor" in result["metadata"]
+
+    async def test_summarizer_input_token_limit_truncates_prefix(self) -> None:
+        """Prefix exceeding summarizer_input_token_limit is truncated from oldest."""
+        summarizer = CapturingSummarizer()
+        # Use a counter that returns 100 tokens per item (~400 chars / 4)
+        # Each item will cost 100 + 4 = 104 tokens with overhead.
+        big_msg = "x" * 400  # ~100 tokens with default counter
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=1,
+            retain_recent_token_budget=None,
+            summarizer_input_token_limit=250,  # Only ~2 items fit (104*2=208 < 250 < 104*3=312)
+        )
+        # 4 turns: first 3 become prefix, last 1 is the tail
+        items = [
+            user_msg(big_msg),  # turn 1 (oldest)
+            user_msg(big_msg),  # turn 2
+            user_msg(big_msg),  # turn 3
+            user_msg("recent"),  # turn 4 (tail)
+        ]
+        result = await policy.compact(items, session_id="s-truncate")
+
+        assert result["summary_generated"] is True
+        # Summariser should have received only 2 items (oldest dropped)
+        assert len(summarizer.calls) == 1
+        _, summarized_items = summarizer.calls[0]
+        assert len(summarized_items) == 2
+        # The 2 kept should be the newest from the prefix (items[1] and items[2])
+        assert summarized_items[0] == items[1]
+        assert summarized_items[1] == items[2]
+
+    async def test_summarizer_input_token_limit_preserves_pairs(self) -> None:
+        """Prefix truncation keeps function_call/output pairs atomic."""
+        summarizer = CapturingSummarizer()
+        big_msg = "x" * 400  # ~100 tokens → 104 with overhead
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=1,
+            retain_recent_token_budget=None,
+            # Budget for ~3 items (312 tokens), but a pair costs 2 slots
+            summarizer_input_token_limit=350,
+        )
+        items = [
+            user_msg(big_msg),  # oldest (will be dropped)
+            function_call("fc1", "tool", big_msg),  # pair: must keep both or neither
+            function_call_output("fc1", big_msg),
+            user_msg("recent"),  # tail
+        ]
+        result = await policy.compact(items, session_id="s-pairs")
+
+        assert result["summary_generated"] is True
+        _, summarized_items = summarizer.calls[0]
+        # The pair should be kept together (2 items) — oldest user msg dropped
+        call_ids = [item.get("call_id") for item in summarized_items if item.get("call_id")]
+        # Either both pair items are present or neither
+        assert call_ids.count("fc1") in (0, 2)
+
+    async def test_summarizer_input_token_limit_none_disables_truncation(self) -> None:
+        """Setting summarizer_input_token_limit=None sends full prefix."""
+        summarizer = CapturingSummarizer()
+        big_msg = "x" * 400
+        policy = SummarizingPolicy(
+            summarizer,
+            retain_recent_turns=1,
+            retain_recent_token_budget=None,
+            summarizer_input_token_limit=None,  # disabled
+        )
+        items = [
+            user_msg(big_msg),
+            user_msg(big_msg),
+            user_msg(big_msg),
+            user_msg("recent"),  # tail
+        ]
+        result = await policy.compact(items, session_id="s-no-limit")
+
+        assert result["summary_generated"] is True
+        _, summarized_items = summarizer.calls[0]
+        # All 3 prefix items sent without truncation
+        assert len(summarized_items) == 3
+
+    async def test_summarizer_input_token_limit_in_get_config(self) -> None:
+        """get_config() includes summarizer_input_token_limit."""
+        policy = SummarizingPolicy(
+            CapturingSummarizer(),
+            summarizer_input_token_limit=50_000,
+        )
+        config = policy.get_config()
+        assert config["summarizer_input_token_limit"] == 50_000
+
+    async def test_summarizer_input_token_limit_requires_token_counter(self) -> None:
+        """Cannot set summarizer_input_token_limit without a token_counter."""
+        with pytest.raises(ValueError, match="summarizer_input_token_limit requires"):
+            SummarizingPolicy(
+                CapturingSummarizer(),
+                summarizer_input_token_limit=60_000,
+                token_counter=None,
+                retain_recent_token_budget=None,
+            )
